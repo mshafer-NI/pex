@@ -12,18 +12,18 @@ runs:
   steps:
     - name: Expose Pythons
       run: |
-        echo $(uname -s)
+        echo uname is $(uname -s)
         which python3
-        find /c/hostedtoolcache/ -type f || echo "windows path does not exist"
+        find /c/hostedtoolcache/ -type f -name python || echo "windows path does not exist"
         if [[ "$(uname -s)" == "Darwin" ]]; then
           toolcache="/Users/runner/hostedtoolcache"
           python_bin_suffix="/bin"
         elif [[ "$(uname -s)" == MINGW64_NT* ]]; then
           toolcache="/c/hostedtoolcache/windows"
-          python_bin_suffix="/bin"
+          python_bin_suffix=""
         else
           toolcache="/opt/hostedtoolcache"
-          python_bin_suffix=""
+          python_bin_suffix="/bin"
         fi
         echo "::group::Exposing Pythons"
         for python_location in ${toolcache}/Python/*/x64; do

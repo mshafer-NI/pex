@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from uuid import uuid4
 
+from pex.compatibility import WINDOWS
 from pex.enum import Enum
 from pex.typing import TYPE_CHECKING, cast
 

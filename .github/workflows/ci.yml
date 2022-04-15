@@ -16,7 +16,8 @@ concurrency:
 jobs:
   org-check:
     name: Check GitHub Organization
-    if: github.repository_owner == 'pantsbuild'
+    # TODO: re-enable this check, run in my fork as well
+    # if: github.repository_owner == 'pantsbuild'
     runs-on: ubuntu-20.04
     steps:
       - name: Noop

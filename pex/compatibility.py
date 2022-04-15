@@ -144,7 +144,8 @@ else:
     from Queue import Queue as Queue
 
 WINDOWS = os.name == "nt"
-
+if os.name not in ["nt", "posix"]:
+    raise Exception("OS name is", os.name)
 
 # Universal newlines is the default in Python 3.
 MODE_READ_UNIVERSAL_NEWLINES = "rU" if PY2 else "r"

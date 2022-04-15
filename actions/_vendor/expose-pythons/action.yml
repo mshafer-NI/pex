@@ -14,7 +14,7 @@ runs:
       run: |
         echo $(uname -s)
         which python3
-        find /c/hostedtoocache/ -type f || echo "windows path does not exist"
+        find /c/hostedtoolcache/ -type f || echo "windows path does not exist"
         if [[ "$(uname -s)" == "Darwin" ]]; then
           toolcache="/Users/runner/hostedtoolcache"
           python_bin_suffix="/bin"

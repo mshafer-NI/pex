@@ -1,6 +1,828 @@
 Release Notes
 =============
 
+2.1.79
+------
+
+This release fixes ``--lock`` resolving for certain cases where extras
+are involved as well as introducing support for generating and consuming
+portable ``--find-links`` locks using ``-path-mapping``.
+
+* Fix ``--lock`` resolver extras handling. (#1719)
+  `PR #1719 <https://github.com/pantsbuild/pex/pull/1719>`_
+
+* Support canonicalizing absolute paths in locks. (#1716)
+  `PR #1712 <https://github.com/pantsbuild/pex/pull/1716>`_
+
+2.1.78
+------
+
+This release fixes missing artifacts in non-``strict`` locks.
+
+* Don't clear lock link database during analysis. (#1712)
+  `PR #1712 <https://github.com/pantsbuild/pex/pull/1712>`_
+
+2.1.77
+------
+
+This release fixes pathologically slow cases of lock creation as well as
+introducing support for ``--no-compression`` to allow picking the the
+time-space tradeoff you want for your PEX zips.
+
+* Fix pathologic lock creation slowness. (#1707)
+  `PR #1707 <https://github.com/pantsbuild/pex/pull/1707>`_
+
+* Support uncompressed PEXes. (#1705)
+  `PR #1705 <https://github.com/pantsbuild/pex/pull/1705>`_
+
+2.1.76
+------
+
+This release finalizes spurious deadlock handling in ``--lock`` resolves
+worked around in #1694 in Pex 2.1.75.
+
+* Fix lock_resolver to use BSD file locks. (#1702)
+  `PR #1702 <https://github.com/pantsbuild/pex/pull/1702>`_
+
+2.1.75
+------
+
+This release fixes a deadlock when building PEXes in parallel
+via the new ``--lock`` flag.
+
+* Avoid deadlock error when run in parallel. (#1694)
+  `PR #1694 <https://github.com/pantsbuild/pex/pull/1694>`_
+
+2.1.74
+------
+
+This release fixes multiplatform ``--lock`` resolves for sdists that are
+built to multiple platform specific wheels and it also introduces
+support for VCS requirements in locks.
+
+* Add support for locking VCS requirements. (#1687)
+  `PR #1684 <https://github.com/pantsbuild/pex/pull/1687>`_
+
+* Fix ``--lock`` for multiplatform via sdists. (#1689)
+  `PR #1684 <https://github.com/pantsbuild/pex/pull/1689>`_
+
+2.1.73
+------
+
+This is a hotfix for various PEX issues:
+
+#. ``--requirements-pex`` handling was broken by #1661 in the 2.1.71
+   release and is now fixed.
+#. Creating ``universal`` locks now works using any interpreter when the
+   resolver version is the ``pip-2020-resolver``.
+#. Building PEXes with ``--lock`` resolves that contain wheels with
+   build tags in their names now works.
+
+* Fix ``--requirements-pex``. (#1684)
+  `PR #1684 <https://github.com/pantsbuild/pex/pull/1684>`_
+
+* Fix universal locks for the ``pip-2020-resolver``. (#1682)
+  `PR #1682 <https://github.com/pantsbuild/pex/pull/1682>`_
+
+* Fix ``--lock`` resolve wheel tag parsing. (#1678)
+  `PR #1678 <https://github.com/pantsbuild/pex/pull/1678>`_
+
+2.1.72
+------
+
+This release fixes an old bug with ``--venv`` PEXes initially executed
+with either ``PEX_MODULE`` or ``PEX_SCRIPT`` active in the environment.
+
+* Fix venv creation to ignore ambient PEX env vars. (#1669)
+  `PR #1669 <https://github.com/pantsbuild/pex/pull/1669>`_
+
+2.1.71
+------
+
+This release fixes the instability introduced in 2.1.68 by switching to
+a more robust means of determining venv layouts. Along the way it
+upgrades Pex internals to cache all artifacts with strong hashes (
+previously sha1 was used). It's strongly recommended to upgrade or use
+the exclude ``!=2.1.68,!=2.1.69,!=2.1.70`` when depending on an open
+ended Pex version range.
+
+* Switch Pex installed wheels to ``--prefix`` scheme. (#1661)
+  `PR #1661 <https://github.com/pantsbuild/pex/pull/1661>`_
+
+2.1.70
+------
+
+This is another hotfix release for 2.1.68 that fixes a bug in
+``*.data/*`` file handling for installed wheels which is outlined in
+`PEP 427
+<https://www.python.org/dev/peps/pep-0427/#installing-a-wheel-distribution-1-0-py32-none-any-whl>`_
+
+* Handle ``*.data/*`` RECORD entries not existing. (#1644)
+  `PR #1644 <https://github.com/pantsbuild/pex/pull/1644>`_
+
+2.1.69
+------
+
+This is a hotfix release for a regression introduced in 2.1.68 for a
+narrow class of ``--venv`` ``--no-venv-site-packages-copies`` mode
+PEXes with special contents on the ``PEX_PATH``.
+
+*  Fix venv creation for duplicate symlinked dists. (#1639)
+   `PR #1639 <https://github.com/pantsbuild/pex/pull/1639>`_
+
+2.1.68
+------
+
+This release brings a fix for installation of additional data files in
+PEX venvs (More on additional data files `here
+<https://setuptools.pypa.io/en/latest/deprecated/distutils/setupscript.html?highlight=data_files#installing-additional-files>`_)
+as well as a new venv install ``--scope`` that can be used to create fully
+optimized container images with PEXed applications (See how to use this feature `here
+<https://pex.readthedocs.io/en/latest/recipes.html#pex-app-in-a-container>`_).
+
+* Support splitting venv creation into deps & srcs. (#1634)
+  `PR #1634 <https://github.com/pantsbuild/pex/pull/1634>`_
+
+* Fix handling of data files when creating venvs. (#1632)
+  `PR #1632 <https://github.com/pantsbuild/pex/pull/1632>`_
+
+2.1.67
+------
+
+This release brings support for ``--platform`` arguments with a
+3-component PYVER portion. This supports working around
+``python_full_version`` environment marker evaluation failures for
+``--platform`` resolves by changing, for example, a platform of
+``linux_x86_64-cp-38-cp38`` to ``linux_x86_64-cp-3.8.10-cp38``. This is
+likely a simpler way to work around these issues than using the
+``--complete-platform`` facility introduced in 2.1.66 by #1609.
+
+* Expand ``--platform`` syntax: support full versions. (#1614)
+  `PR #1614 <https://github.com/pantsbuild/pex/pull/1614>`_
+
+2.1.66
+------
+
+This release brings a new ``--complete-platform`` Pex CLI option that
+can be used instead of ``--platform`` when more detailed foreign
+platform specification is needed to satisfy a resolve (most commonly,
+when ``python_full_version`` environment markers are in-play). This,
+paired with the new ``pex3 interpreter inspect`` command that can be
+used to generate complete platform data on the foreign platform machine
+being targeted, should allow all foreign platform PEX builds to succeed
+exactly as they would if run on that foreign platform as long as
+pre-built wheels are available for that foreign platform.
+
+Additionally, PEXes now know how to set a useable process name when the
+PEX contains the `setproctitle` distribution. See
+`here <https://pex.readthedocs.io/en/v2.1.66/recipes.html#long-running-pex-applications-and-daemons>`_
+for more information.
+
+* Add support for ``--complete-platform``. (#1609)
+  `PR #1609 <https://github.com/pantsbuild/pex/pull/1609>`_
+
+* Introduce ``pex3 interpreter inspect``. (#1607)
+  `PR #1607 <https://github.com/pantsbuild/pex/pull/1607>`_
+
+* Use setproctitle to sanitize ``ps`` info. (#1605)
+  `PR #1605 <https://github.com/pantsbuild/pex/pull/1605>`_
+
+* Respect ``PEX_ROOT`` in ``PEXEnvironment.mount``. (#1599)
+  `PR #1599 <https://github.com/pantsbuild/pex/pull/1599>`_
+
+2.1.65
+------
+
+This release really brings support for mac universal2 wheels. The fix
+provided by 2.1.64 was partial; universal2 wheels could be resolved at
+build time, but not at runtime.
+
+* Upgrade vendored packaging to 20.9. (#1591)
+  `PR #1591 <https://github.com/pantsbuild/pex/pull/1591>`_
+
+2.1.64
+------
+
+This release brings support for mac universal2 wheels.
+
+* Update vendored Pip to 386a54f0. (#1589)
+  `PR #1589 <https://github.com/pantsbuild/pex/pull/1589>`_
+
+2.1.63
+------
+
+This release fixes spurious collision warnings & errors when building
+venvs from PEXes that contain multiple distributions contributing to the
+same namespace package.
+
+* Allow for duplicate files in venv population. (#1572)
+  `PR #1572 <https://github.com/pantsbuild/pex/pull/1572>`_
+
+2.1.62
+------
+
+This release exposes three Pip options as Pex options to allow building
+PEXes for more of the Python distribution ecosystem:
+
+#. ``--prefer-binary``: To prefer older wheels to newer sdists in a
+   resolve which can help avoid problematic builds.
+#. ``--[no]-use-pep517``: To control how sdists are built: always using
+   PEP-517, always using setup.py or the default, always using whichever
+   is appropriate.
+#. ``--no-build-isolation``: To allow distributions installed in the
+   environment to be seen during builds of sdists. This allows working
+   around distributions with undeclared build dependencies by
+   pre-installing them in the environment before running Pex.
+
+* Expose more Pip options. (#1561)
+  `PR #1561 <https://github.com/pantsbuild/pex/pull/1561>`_
+
+2.1.61
+------
+
+This release fixes a regression in Pex ``--venv`` mode compatibility
+with distributions that are members of a namespace package that was
+introduced by #1532 in the 2.1.57 release.
+
+* Merge packages for ``--venv-site-packages-copies``. (#1557)
+  `PR #1557 <https://github.com/pantsbuild/pex/pull/1557>`_
+
+2.1.60
+------
+
+This release fixes a bug that prevented creating PEXes when duplicate
+compatible requirements were specified using the pip-2020-resolver.
+
+* Fix Pex to be duplicate requirement agnostic. (#1551)
+  `PR #1551 <https://github.com/pantsbuild/pex/pull/1551>`_
+
+2.1.59
+------
+
+This release adds the boolean option ``--venv-site-packages-copies`` to
+control whether ``--venv`` execution mode PEXes create their venv with
+copies (hardlinks when possible) or symlinks. It also fixes a bug that
+prevented Python 3.10 interpreters from being discovered when
+``--interpreter-constraint`` was used.
+
+* Add knob for --venv site-packages symlinking. (#1543)
+  `PR #1543 <https://github.com/pantsbuild/pex/pull/1543>`_
+
+* Fix Pex to identify Python 3.10 interpreters. (#1545)
+  `PR #1545 <https://github.com/pantsbuild/pex/pull/1545>`_
+
+2.1.58
+------
+
+This release fixes a bug handling relative ``--cert`` paths.
+
+* Always pass absolute cert path to Pip. (#1538)
+  `PR #1538 <https://github.com/pantsbuild/pex/pull/1538>`_
+
+2.1.57
+------
+
+This release brings a few performance improvements and a new `venv`
+pex-tools ``--remove`` feature that is useful for creating optimized
+container images from PEX files.
+
+* Do not re-hash installed wheels. (#1534)
+  `PR #1534 <https://github.com/pantsbuild/pex/pull/1534>`_
+
+* Improve space efficiency of ``--venv`` mode. (#1532)
+  `PR #1532 <https://github.com/pantsbuild/pex/pull/1532>`_
+
+* Add venv ``--remove {pex,all}`` option. (#1525)
+  `PR #1525 <https://github.com/pantsbuild/pex/pull/1525>`_
+
+2.1.56
+------
+
+* Fix wheel install hermeticity. (#1521)
+  `PR #1521 <https://github.com/pantsbuild/pex/pull/1521>`_
+
+2.1.55
+------
+
+This release brings official support for Python 3.10 as well as fixing
+https://pex.readthedocs.io doc generation and fixing help for
+``pex-tools`` / ``PEX_TOOLS=1 ./my.pex`` pex tools invocations that have
+too few arguments.
+
+* Add official support for Python 3.10 (#1512)
+  `PR #1512 <https://github.com/pantsbuild/pex/pull/1512>`_
+
+* Always register global options. (#1511)
+  `PR #1511 <https://github.com/pantsbuild/pex/pull/1511>`_
+
+* Fix RTD generation by pinning docutils low. (#1509)
+  `PR #1509 <https://github.com/pantsbuild/pex/pull/1509>`_
+
+2.1.54
+------
+
+This release fixes a bug in ``--venv`` creation that could mask deeper
+errors populating PEX venvs.
+
+* Fix ``--venv`` mode short link creation. (#1505)
+  `PR #1505 <https://github.com/pantsbuild/pex/pull/1505>`_
+
+2.1.53
+------
+
+This release fixes a bug identifying certain interpreters on macOS
+Monterey.
+
+Additionally, Pex has two new features:
+
+#. It now exposes the ``PEX`` environment variable inside running PEXes
+   to allow application code to both detect it's running from a PEX and
+   determine where that PEX is located.
+#. It now supports a ``--prompt`` option in the ``venv`` tool to allow
+   for customization of the venv activation prompt.
+
+* Guard against fake interpreters. (#1500)
+  `PR #1500 <https://github.com/pantsbuild/pex/pull/1500>`_
+
+* Add support for setting custom venv prompts. (#1499)
+  `PR #1499 <https://github.com/pantsbuild/pex/pull/1499>`_
+
+* Introduce the ``PEX`` env var. (#1495)
+  `PR #1495 <https://github.com/pantsbuild/pex/pull/1495>`_
+
+2.1.52
+------
+
+This release makes a wider array of distributions resolvable for
+``--platform`` resolves by inferring the ``platform_machine``
+environment marker corresponding to the requested ``--platform``.
+
+* Populate ``platform_machine`` in ``--platform`` resolve. (#1489)
+  `PR #1489 <https://github.com/pantsbuild/pex/pull/1489>`_
+
+2.1.51
+------
+
+This release fixes both PEX creation and ``--venv`` creation to handle
+distributions that contain scripts with non-ascii characters in them
+when running in environments with a default encoding that does not
+contain those characters under PyPy3, Python 3.5 and Python 3.6.
+
+* Fix non-ascii script shebang re-writing. (#1480)
+  `PR #1480 <https://github.com/pantsbuild/pex/pull/1480>`_
+
+2.1.50
+------
+
+This is another hotfix of the 2.1.48 release's ``--layout`` feature that
+fixes identification of ``--layout zipapp`` PEXes that have had their
+execute mode bit turned off. A notable example is the Pex PEX when
+downloaded from https://github.com/pantsbuild/pex/releases.
+
+* Fix zipapp layout identification. (#1448)
+  `PR #1448 <https://github.com/pantsbuild/pex/pull/1448>`_
+
+2.1.49
+------
+
+This is a hotfix release that fixes the new ``--layout {zipapp,packed}``
+modes for PEX files with no user code & just third party dependencies
+when executed against a ``$PEX_ROOT`` where similar PEXes built with the
+old ``--not-zip-safe`` option were were run in the past.
+
+* Avoid re-using old ~/.pex/code/ caches. (#1444)
+  `PR #1444 <https://github.com/pantsbuild/pex/pull/1444>`_
+
+2.1.48
+------
+
+This releases introduces the ``--layout`` flag for selecting amongst the
+traditional zipapp layout as a single PEX zip file and two new directory
+tree based formats that may be useful for more sophisticated deployment
+sceanrios.
+
+The ``--unzip`` / ``PEX_UNZIP`` toggles for PEX runtime execution are
+now the default and deprecated as explicit options as a result. You can
+still select the venv runtime execution mode via the
+``--venv`` / ``PEX_VENV`` toggles though.
+
+* Remove zipapp execution mode & introduce ``--layout``. (#1438)
+  `PR #1438 <https://github.com/pantsbuild/pex/pull/1438>`_
+
+2.1.47
+------
+
+This is a hotfix release that fixes a regression for ``--venv`` mode
+PEXes introduced in #1410. These PEXes were not creating new venvs when
+the PEX was unconstrained and executed with any other interpreter than
+the interpreter the venv was first created with.
+
+* Fix ``--venv`` mode venv dir hash. (#1428)
+  `PR #1428 <https://github.com/pantsbuild/pex/pull/1428>`_
+
+* Clarify PEX_PYTHON & PEX_PYTHON_PATH interaction. (#1427)
+  `PR #1427 <https://github.com/pantsbuild/pex/pull/1427>`_
+
+2.1.46
+------
+
+This release improves PEX file build reproducibility and requirement
+parsing of environment markers in Pip's proprietary URL format.
+
+Also, the `-c` / `--script` / `--console-script` argument now supports
+non-Python distribution scripts.
+
+Finally, new contributor @blag improved the README.
+
+* Fix Pip proprietary URL env marker handling. (#1417)
+  `PR #1417 <https://github.com/pantsbuild/pex/pull/1417>`_
+
+* Un-reify installed wheel script shebangs. (#1410)
+  `PR #1410 <https://github.com/pantsbuild/pex/pull/1410>`_
+
+* Support deterministic repository extract tool. (#1411)
+  `PR #1411 <https://github.com/pantsbuild/pex/pull/1411>`_
+
+* Improve examples and add example subsection titles (#1409)
+  `PR #1409 <https://github.com/pantsbuild/pex/pull/1409>`_
+
+* support any scripts specified in `setup(scripts=...)` from setup.py. (#1381)
+  `PR #1381 <https://github.com/pantsbuild/pex/pull/1381>`_
+
+2.1.45
+------
+
+This is a hotfix release that fixes the ``--bdist-all`` handling in the
+``bdist_pex`` distutils command that regressed in 2.1.43 to only create
+a bdist for the first discovered entry point.
+
+* Fix --bdist-all handling multiple console_scripts (#1396)
+  `PR #1396 <https://github.com/pantsbuild/pex/pull/1396>`_
+
+2.1.44
+------
+
+This is a hotfix release that fixes env var collisions (introduced in
+the Pex 2.1.43 release by
+`PR #1367 <https://github.com/pantsbuild/pex/pull/1367>`_) that could
+occur when invoking Pex with environment variables like ``PEX_ROOT``
+defined.
+
+* Fix Pip handling of internal env vars. (#1388)
+  `PR #1388 <https://github.com/pantsbuild/pex/pull/1388>`_
+
+2.1.43
+------
+
+* Fix dist-info metadata discovery. (#1376)
+  `PR #1376 <https://github.com/pantsbuild/pex/pull/1376>`_
+
+* Fix ``--platform`` resolve handling of env markers. (#1367)
+  `PR #1367 <https://github.com/pantsbuild/pex/pull/1367>`_
+
+* Fix ``--no-manylinux``. (#1365)
+  `PR #1365 <https://github.com/pantsbuild/pex/pull/1365>`_
+
+* Allow ``--platform`` resolves for current interpreter. (#1364)
+  `PR #1364 <https://github.com/pantsbuild/pex/pull/1364>`_
+
+* Do not suppress pex output in bidst_pex (#1358)
+  `PR #1358 <https://github.com/pantsbuild/pex/pull/1358>`_
+
+* Warn for PEX env vars unsupported by venv. (#1354)
+  `PR #1354 <https://github.com/pantsbuild/pex/pull/1354>`_
+
+* Fix execution modes. (#1353)
+  `PR #1353 <https://github.com/pantsbuild/pex/pull/1353>`_
+
+* Fix Pex emitting warnings about its Pip PEX venv. (#1351)
+  `PR #1351 <https://github.com/pantsbuild/pex/pull/1351>`_
+
+* Support more verbose output for interpreter info. (#1347)
+  `PR #1347 <https://github.com/pantsbuild/pex/pull/1347>`_
+
+* Fix typo in recipes.rst (#1342)
+  `PR #1342 <https://github.com/pantsbuild/pex/pull/1342>`_
+
+2.1.42
+------
+
+This release brings a bugfix for macOS interpreters when the
+MACOSX_DEPLOYMENT_TARGET sysconfig variable is numeric as well as a fix
+that improves Pip execution environment isolation.
+
+* Fix MACOSX_DEPLOYMENT_TARGET handling. (#1338)
+  `PR #1338 <https://github.com/pantsbuild/pex/pull/1338>`_
+
+* Better isolate Pip. (#1339)
+  `PR #1339 <https://github.com/pantsbuild/pex/pull/1339>`_
+
+2.1.41
+------
+
+This release brings a hotfix from @kaos for interpreter identification
+on macOS 11.
+
+* Update interpreter.py (#1332)
+  `PR #1332 <https://github.com/pantsbuild/pex/pull/1332>`_
+
+2.1.40
+------
+
+This release brings proper support for pyenv shim interpreter
+identification as well as a bug fix for venv mode.
+
+* Fix Pex venv mode to respect ``--strip-pex-env``. (#1329)
+  `PR #1329 <https://github.com/pantsbuild/pex/pull/1329>`_
+
+* Fix pyenv shim identification. (#1325)
+  `PR #1325 <https://github.com/pantsbuild/pex/pull/1325>`_
+
+2.1.39
+------
+
+A hotfix that fixes a bug present since 2.1.25 that results in infinite
+recursion in PEX runtime resolves when handling dependency cycles.
+
+* Guard against cyclic dependency graphs. (#1317)
+  `PR #1317 <https://github.com/pantsbuild/pex/pull/1317>`_
+
+2.1.38
+------
+
+A hotfix that finishes work started in 2.1.37 by #1304 to align Pip
+based resolve results with ``--pex-repository`` based resolve results
+for requirements with '.' in their names as allowed by PEP-503.
+
+* Fix PEX direct requirements metadata. (#1312)
+  `PR #1312 <https://github.com/pantsbuild/pex/pull/1312>`_
+
+2.1.37
+------
+
+* Fix Pex isolation to avoid temporary pyc files. (#1308)
+  `PR #1308 <https://github.com/pantsbuild/pex/pull/1308>`_
+
+* Fix --pex-repository requirement canonicalization. (#1304)
+  `PR #1304 <https://github.com/pantsbuild/pex/pull/1304>`_
+
+* Spruce up ``pex`` and ``pex-tools`` CLIs with uniform ``-V`` /
+  ``--version`` support and default value display in help. (#1301)
+  `PR #1301 <https://github.com/pantsbuild/pex/pull/1301>`_
+
+2.1.36
+------
+
+This release brings a fix for building sdists with certain macOS
+interpreters when creating a PEX file that would then fail to resolve
+on PEX startup.
+
+* Add support for ``--seed verbose``. (#1299)
+  `PR #1299 <https://github.com/pantsbuild/pex/pull/1299>`_
+
+* Fix bytecode compilation race in PEXBuilder.build. (#1298)
+  `PR #1298 <https://github.com/pantsbuild/pex/pull/1298>`_
+
+* Fix wheel building for certain macOS system interpreters. (#1296)
+  `PR #1296 <https://github.com/pantsbuild/pex/pull/1296>`_
+
+2.1.35
+------
+
+This release hardens a few aspects of `--venv` mode PEXes. An infinite
+re-exec loop in venv `pex` scripts is fixed and the `activate` family
+of scripts in the venv is fixed.
+
+* Improve resolve error information. (#1287)
+  `PR #1287 <https://github.com/pantsbuild/pex/pull/1287>`_
+
+* Ensure venv pex does not enter a re-exec loop. (#1286)
+  `PR #1286 <https://github.com/pantsbuild/pex/pull/1286>`_
+
+* Expose Pex tools via a pex-tools console script. (#1279)
+  `PR #1279 <https://github.com/pantsbuild/pex/pull/1279>`_
+
+* Fix auto-created `--venv` core scripts. (#1278)
+  `PR #1278 <https://github.com/pantsbuild/pex/pull/1278>`_
+
+2.1.34
+------
+
+Beyond bugfixes for a few important edge cases, this release includes
+new support for @argfiles on the command line from @jjhelmus. These
+can be useful to overcome command line length limitations. See:
+https://docs.python.org/3/library/argparse.html#fromfile-prefix-chars.
+
+* Allow cli arguments to be specified in a file (#1273)
+  `PR #1273 <https://github.com/pantsbuild/pex/pull/1273>`_
+
+* Fix module entrypoints. (#1274)
+  `PR #1274 <https://github.com/pantsbuild/pex/pull/1274>`_
+
+* Guard against concurrent re-imports. (#1270)
+  `PR #1270 <https://github.com/pantsbuild/pex/pull/1270>`_
+
+* Ensure Pip logs to stderr. (#1268)
+  `PR #1268 <https://github.com/pantsbuild/pex/pull/1268>`_
+
+2.1.33
+------
+
+* Support console scripts found in the PEX_PATH. (#1265)
+  `PR #1265 <https://github.com/pantsbuild/pex/pull/1265>`_
+
+* Fix Requires metadata handling. (#1262)
+  `PR #1262 <https://github.com/pantsbuild/pex/pull/1262>`_
+
+* Fix PEX file reproducibility. (#1259)
+  `PR #1259 <https://github.com/pantsbuild/pex/pull/1259>`_
+
+* Fix venv script shebang rewriting. (#1260)
+  `PR #1260 <https://github.com/pantsbuild/pex/pull/1260>`_
+
+* Introduce the repository PEX_TOOL. (#1256)
+  `PR #1256 <https://github.com/pantsbuild/pex/pull/1256>`_
+
+2.1.32
+------
+
+This is a hotfix release that fixes ``--venv`` mode shebangs being too long for some Linux
+environments.
+
+* Guard against too long ``--venv`` mode shebangs. (#1254)
+  `PR #1254 <https://github.com/pantsbuild/pex/pull/1254>`_
+
+2.1.31
+------
+
+This release primarily hardens Pex venvs fixing several bugs.
+
+* Fix Pex isolation. (#1250)
+  `PR #1250 <https://github.com/pantsbuild/pex/pull/1250>`_
+
+* Support pre-compiling a venv. (#1246)
+  `PR #1246 <https://github.com/pantsbuild/pex/pull/1246>`_
+
+* Support venv relocation. (#1247)
+  `PR #1247 <https://github.com/pantsbuild/pex/pull/1247>`_
+
+* Fix `--runtime-pex-root` leak in pex bootstrap. (#1244)
+  `PR #1244 <https://github.com/pantsbuild/pex/pull/1244>`_
+
+* Support venvs that can outlive their base python. (#1245)
+  `PR #1245 <https://github.com/pantsbuild/pex/pull/1245>`_
+
+* Harden Pex interpreter identification. (#1248)
+  `PR #1248 <https://github.com/pantsbuild/pex/pull/1248>`_
+
+* The `pex` venv script handles entrypoints like PEX. (#1242)
+  `PR #1242 <https://github.com/pantsbuild/pex/pull/1242>`_
+
+* Ensure PEX files aren't symlinked in venv. (#1240)
+  `PR #1240 <https://github.com/pantsbuild/pex/pull/1240>`_
+
+* Fix venv pex script for use with multiprocessing. (#1238)
+  `PR #1238 <https://github.com/pantsbuild/pex/pull/1238>`_
+
+2.1.30
+------
+
+This release fixes another bug in --venv mode when PEX_PATH is exported in the environment.
+
+* Fix --venv mode to respect PEX_PATH. (#1227)
+  `PR #1227 <https://github.com/pantsbuild/pex/pull/1227>`_
+
+2.1.29
+------
+
+This release fixes bugs in `--unzip` and `--venv` mode PEX file execution and upgrades to the last
+release of Pip to support Python 2.7.
+
+* Fix PyPy3 `--venv` mode. (#1221)
+  `PR #1221 <https://github.com/pantsbuild/pex/pull/1221>`_
+
+* Make `PexInfo.pex_hash` calculation more robust.  (#1219)
+  `PR #1219 <https://github.com/pantsbuild/pex/pull/1219>`_
+
+* Upgrade to Pip 20.3.4 patched. (#1205)
+  `PR #1205 <https://github.com/pantsbuild/pex/pull/1205>`_
+
+2.1.28
+------
+
+This is another hotfix release to fix incorrect resolve post-processing failing otherwise correct
+resolves.
+
+* Pex resolver fails to evaluate markers when post-processing resolves to identify which dists
+  satisfy direct requirements. (#1196)
+  `PR #1196 <https://github.com/pantsbuild/pex/pull/1196>_`
+
+2.1.27
+------
+
+This is another hotfix release to fix a regression in Pex ``--sources-directory`` handling of
+relative paths.
+
+* Support relative paths in `Chroot.symlink`. (#1194)
+  `PR #1194 <https://github.com/pantsbuild/pex/pull/1194>_`
+
+2.1.26
+------
+
+This is a hotfix release that fixes requirement parsing when there is a local file in the CWD with
+the same name as the project name of a remote requirement to be resolved.
+
+* Requirement parsing handles local non-dist files. (#1190)
+  `PR #1190 <https://github.com/pantsbuild/pex/pull/1190>`_
+
+2.1.25
+------
+
+This release brings support for a ``--venv`` execution mode to complement ``--unzip`` and standard
+unadorned PEX zip file execution modes. The ``--venv`` execution mode will first install the PEX
+file into a virtual environment under ``${PEX_ROOT}/venvs`` and then re-execute itself from there.
+This mode of execution allows you to ship your PEXed application as a single zipfile that
+automatically installs itself in a venv and runs from there to eliminate all PEX startup overhead
+on subsequent runs and work like a "normal" application.
+
+There is also support for a new resolution mode when building PEX files that allows you to use the
+results of a previous resolve by specifying it as a ``-pex-repository`` to resolve from. If you have
+many applications sharing a requirements.txt / constraints.txt, this can drastically speed up
+resolves.
+
+* Improve PEX repository error for local projects. (#1184)
+  `PR #1184 <https://github.com/pantsbuild/pex/pull/1184>`_
+
+* Use symlinks to add dists in the Pex CLI. (#1185)
+  `PR #1185 <https://github.com/pantsbuild/pex/pull/1185>`_
+
+* Suppress ``pip debug`` warning. (#1183)
+  `PR #1183 <https://github.com/pantsbuild/pex/pull/1183>`_
+
+* Support resolving from a PEX file repository. (#1182)
+  `PR #1182 <https://github.com/pantsbuild/pex/pull/1182>`_
+
+* PEXEnvironment for a DistributionTarget. (#1178)
+  `PR #1178 <https://github.com/pantsbuild/pex/pull/1178>`_
+
+* Fix plumbing of 2020-resolver to Pip. (#1180)
+  `PR #1180 <https://github.com/pantsbuild/pex/pull/1180>`_
+
+* Platform can report supported_tags. (#1177)
+  `PR #1177 <https://github.com/pantsbuild/pex/pull/1177>`_
+
+* Record original requirements in PEX-INFO. (#1171)
+  `PR #1171 <https://github.com/pantsbuild/pex/pull/1171>`_
+
+* Tighten requirements parsing. (#1170)
+  `PR #1170 <https://github.com/pantsbuild/pex/pull/1170>`_
+
+* Type BuildAndInstallRequest. (#1169)
+  `PR #1169 <https://github.com/pantsbuild/pex/pull/1169>`_
+
+* Type AtomicDirectory. (#1168)
+  `PR #1168 <https://github.com/pantsbuild/pex/pull/1168>`_
+
+* Type SpawnedJob. (#1167)
+  `PR #1167 <https://github.com/pantsbuild/pex/pull/1167>`_
+
+* Refresh and type OrderedSet. (#1166)
+  `PR #1166 <https://github.com/pantsbuild/pex/pull/1166>`_
+
+* PEXEnvironment recursive runtime resolve. (#1165)
+  `PR #1165 <https://github.com/pantsbuild/pex/pull/1165>`_
+
+* Add support for -r / --constraints URL to the CLI. (#1163)
+  `PR #1163 <https://github.com/pantsbuild/pex/pull/1163>`_
+
+* Surface Pip dependency conflict information. (#1162)
+  `Issue #9420 <https://github.com/pypa/pip/issues/9420>`_
+  `PR #1162 <https://github.com/pantsbuild/pex/pull/1162>`_
+
+* Add support for parsing extras and specifiers. (#1161)
+  `PR #1161 <https://github.com/pantsbuild/pex/pull/1161>`_
+
+* Support project_name_and_version metadata. (#1160)
+  `PR #1160 <https://github.com/pantsbuild/pex/pull/1160>`_
+
+* docs: fix simple typo, orignal -> original (#1156)
+  `PR #1156 <https://github.com/pantsbuild/pex/pull/1156>`_
+
+* Support a --venv mode similar to --unzip mode. (#1153)
+  `PR #1153 <https://github.com/pantsbuild/pex/pull/1153>`_
+
+* Remove redundant dep edge label info. (#1152)
+  `PR #1152 <https://github.com/pantsbuild/pex/pull/1152>`_
+
+* Remove our reliance on packaging's LegacyVersion. (#1151)
+  `PR #1151 <https://github.com/pantsbuild/pex/pull/1151>`_
+
+* Implement PEX_INTERPRETER special mode support. (#1149)
+  `PR #1149 <https://github.com/pantsbuild/pex/pull/1149>`_
+
+* Fix PexInfo.copy. (#1148)
+  `PR #1148 <https://github.com/pantsbuild/pex/pull/1148>`_
+
 2.1.24
 ------
 
@@ -10,10 +832,10 @@ also fixed to install for Python 3.9.1+.
 
 * Upgrade to a patched Pip 20.3.3. (#1143)
   `Issue #9283 <https://github.com/pypa/pip/issues/9283>`_
-  `PR #1143 <https://github.com/pantsbuild/pants/pex/pull/1143>`_
+  `PR #1143 <https://github.com/pantsbuild/pex/pull/1143>`_
 
 * Fix python requirement to include full 3.9 series. (#1142)
-  `PR #1142 <https://github.com/pantsbuild/pants/pex/pull/1142>`_
+  `PR #1142 <https://github.com/pantsbuild/pex/pull/1142>`_
 
 2.1.23
 ------
@@ -38,8 +860,8 @@ PEX files in highly concurrent environments in addition to fixing
 `pex --help-variables` output.
 
 A new suite of PEX tools is now available in Pex itself and any PEXes
-built with the new `--include-tools` option. Use 
-`PEX_TOOLS=1 pex --help` to find out more about the available tools and 
+built with the new `--include-tools` option. Use
+`PEX_TOOLS=1 pex --help` to find out more about the available tools and
 their usage.
 
 Finally, the long deprecated exposure of the Pex APIs through `_pex` has
@@ -238,16 +1060,16 @@ and a bug in the ``-D / --sources-directory`` and
 (namespace) packages were not respected (#1021).
 
 * Improve UnsatisfiableInterpreterConstraintsError. (#1028)
-  `PR #1028 <https://github.com/pantsbuild/pants/pull/1028>`_
+  `PR #1028 <https://github.com/pantsbuild/pex/pull/1028>`_
 
 * Scrub direct sys.path manipulations by .pth files. (#1026)
-  `PR #1026 <https://github.com/pantsbuild/pants/pull/1026>`_
+  `PR #1026 <https://github.com/pantsbuild/pex/pull/1026>`_
 
 * PEX zips now contain directory entries. (#1022)
-  `PR #1022 <https://github.com/pantsbuild/pants/pull/1022>`_
+  `PR #1022 <https://github.com/pantsbuild/pex/pull/1022>`_
 
 * Fix UnsatisfiableInterpreterConstraintsError. (#1024)
-  `PR #1024 <https://github.com/pantsbuild/pants/pull/1024>`_
+  `PR #1024 <https://github.com/pantsbuild/pex/pull/1024>`_
 
 2.1.15
 ------

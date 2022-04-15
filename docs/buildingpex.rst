@@ -95,12 +95,17 @@ You can then import and manipulate modules like you would otherwise:
     >>> import psutil
     >>> ...
 
-Requirements can also be specified using the requirements.txt format, using ``pex -r``.  This can be a handy
-way to freeze a virtualenv into a PEX file:
+Conveniently, the output of ``pip freeze`` (a list of pinned dependencies) can be passed directly to ``pex``. This provides a handy way to freeze a virtualenv into a PEX file.
 
 .. code-block:: console
 
-    $ pex -r <(pip freeze) -o my_application.pex
+    $ pex $(pip freeze) -o my_application.pex
+
+A ``requirements.txt`` file may also be used, just as with ``pip``.
+
+.. code-block:: console
+
+    $ pex -r requirements.txt -o my_application.pex
 
 
 Specifying entry points
@@ -186,17 +191,18 @@ get pydoc help on the ``flask.app`` package in Flask:
 
 and so forth.
 
-Entry points can also take the form ``package:target``, such as ``sphinx:main`` or ``fabric.main:main`` for Sphinx
-and Fabric respectively.  This is roughly equivalent to running a script that does ``from package import target; target()``.
+Entry points can also take the form ``package:target``, such as ``sphinx:main`` or
+``fabric.main:main`` for Sphinx and Fabric respectively.  This is roughly equivalent to running a
+script that does ``import sys, from package import target; sys.exit(target())``.
 
 This can be a powerful way to invoke Python applications without ever having to ``pip install``
 anything, for example a one-off invocation of Sphinx with the readthedocs theme available:
 
 .. code-block:: console
 
-    $ pex sphinx sphinx_rtd_theme -e sphinx:main -- --help
+    $ pex sphinx==1.2.2 sphinx_rtd_theme -e sphinx:main -- --help
     Sphinx v1.2.2
-    Usage: /var/folders/4d/9tz0cd5n2n7947xs21gspsxc0000gp/T/tmpLr8ibZ [options] sourcedir outdir [filenames...]
+    Usage: /tmp/tmpydcp6kox [options] sourcedir outdir [filenames...]
 
     General options
     ^^^^^^^^^^^^^^^
@@ -205,12 +211,19 @@ anything, for example a one-off invocation of Sphinx with the readthedocs theme 
     -E            don't use a saved environment, always read all files
     ...
 
+Although sys.exit is applied blindly to the return value of the target function, this probably does
+what you want due to very flexible ``sys.exit`` semantics. Consult your target function and
+`sys.exit <https://docs.python.org/library/sys.html#sys.exit>`_ documentation to be sure.
+
+Almost certainly better and more stable, you can alternatively specify a console script exported by
+the app as explained below.
+
 pex -c
 ~~~~~~
 
-If you don't know the ``package:target`` for the console scripts of
-your favorite python packages, pex allows you to use ``-c`` to specify a console script as defined
-by the distribution.  For example, Fabric provides the ``fab`` tool when pip installed:
+If you don't know the ``package:target`` for the console scripts of your favorite python packages,
+pex allows you to use ``-c`` to specify a console script as defined by the distribution. For
+example, Fabric provides the ``fab`` tool when pip installed:
 
 .. code-block:: console
 
@@ -230,13 +243,13 @@ Even scripts defined by the "scripts" section of a distribution can be used, e.g
                  {bal,hit,hits,new,extend,expire,rm,as,approve,reject,unreject,bonus,notify,give-qual,revoke-qual}
                  ...
     mturk: error: too few arguments
-    
-Note: If you run ``pex -c`` and come across an error similar to 
-``pex.pex_builder.InvalidExecutableSpecification: Could not find script 'mainscript.py' in any distribution within PEX!``, 
-double-check your setup.py and ensure that ``mainscript.py`` is included 
+
+Note: If you run ``pex -c`` and come across an error similar to
+``pex.pex_builder.InvalidExecutableSpecification: Could not find script 'mainscript.py' in any distribution within PEX!``,
+double-check your setup.py and ensure that ``mainscript.py`` is included
 in your setup's ``scripts`` array. If you are using ``console_scripts`` and
 run into this error, double check your ``console_scripts`` syntax - further
-information for both ``scripts`` and ``console_scripts`` can be found in the 
+information for both ``scripts`` and ``console_scripts`` can be found in the
 `Python packaging documentation <https://python-packaging.readthedocs.io/en/latest/command-line-scripts.html>`_.
 
 
@@ -380,14 +393,43 @@ in certain situations when particular extensions may not be necessary to run a p
 ``--platform``
 ~~~~~~~~~~~~~~
 
-The platform to build the pex for. Right now it defaults to the current system, but you can specify
-something like ``linux-x86_64`` or ``macosx-10.6-x86_64``. This will look for bdists for the particular platform.
+The (abbreviated) platform to build the PEX for. This will look for wheels for the particular
+platform.
 
-To resolve wheels for specific interpreter/platform tags, you can append them to the platform name with hyphens
-like ``PLATFORM-IMPL-PYVER-ABI``, where ``PLATFORM`` is the platform (e.g. ``linux-x86_64``,
-``macosx-10.4-x86_64``), ``IMPL`` is the python implementation abbreviation (e.g. ``cp``, ``pp``, ``jp``), ``PYVER``
-is a two-digit string representing the python version (e.g., ``36``) and ``ABI`` is the ABI tag (e.g., ``cp36m``,
-``cp27mu``, ``abi3``, ``none``). A complete example: ``linux_x86_64-cp-36-cp36m``.
+The abbreviated platform is described by a string of the form ``PLATFORM-IMPL-PYVER-ABI``, where
+``PLATFORM`` is the platform (e.g. ``linux-x86_64``, ``macosx-10.4-x86_64``), ``IMPL`` is the python
+implementation abbreviation (``cp`` or ``pp``), ``PYVER`` is either a two or more digit string
+representing the python version (e.g., ``36`` or ``310``) or else a component dotted version
+string (e.g., ``3.6`` or ``3.10.1``) and ``ABI`` is the ABI tag (e.g., ``cp36m``, ``cp27mu``,
+``abi3``, ``none``). A complete example: ``linux_x86_64-cp-36-cp36m``.
+
+**Constraints**: when ``--platform`` is used the
+`environment marker <https://www.python.org/dev/peps/pep-0508/#environment-markers>`_
+``python_full_version`` will not be available if ``PYVER`` is not given as a three component dotted
+version since ``python_full_version`` is meant to have 3 digits (e.g., ``3.8.10``). If a
+``python_full_version`` environment marker is encountered during a resolve, an
+``UndefinedEnvironmentName`` exception will be raised. To remedy this, either specify the full
+version in the platform (e.g, ``linux_x86_64-cp-3.8.10-cp38``) or use ``--complete-platform``
+instead.
+
+``--complete-platform``
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The completely specified platform to build the PEX for. This will look for wheels for the particular
+platform.
+
+The complete platform can be either a path to a file containing JSON data or else a JSON object
+literal. In either case, the JSON object is expected to have two fields with any other fields
+ignored. The ``marker_environment`` field should have an object value with string field values
+corresponding to
+`PEP-508 marker environment <https://www.python.org/dev/peps/pep-0508/#environment-markers>`_
+entries. It is OK to only have a subset of valid marker environment fields but it is not valid to
+present entries not defined in PEP-508. The ``compatible_tags`` field should have an array of
+strings value containing the compatible tags in order from most specific first to least
+specific last as defined in `PEP-425 <https://www.python.org/dev/peps/pep-0425>`_. Pex can create
+complete platform JSON for you by running it on the target platform like so:
+``pex3 interpreter inspect --markers --tags``. For more options, particularly to select the desired
+target interpreter see: ``pex3 interpreter inspect --help``.
 
 Tailoring PEX execution at runtime
 ----------------------------------

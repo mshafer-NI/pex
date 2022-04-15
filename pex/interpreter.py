@@ -12,17 +12,21 @@ import platform
 import re
 import subprocess
 import sys
+import sysconfig
 from collections import OrderedDict
 from textwrap import dedent
 
 from pex import third_party
-from pex.common import is_exe, safe_rmtree
+from pex.common import is_exe, safe_mkdtemp, safe_rmtree
 from pex.compatibility import string
 from pex.executor import Executor
 from pex.jobs import ErrorHandler, Job, Retain, SpawnedJob, execute_parallel
 from pex.orderedset import OrderedSet
+from pex.pep_425 import CompatibilityTags
+from pex.pep_508 import MarkerEnvironment
 from pex.platforms import Platform
-from pex.third_party.packaging import markers, tags
+from pex.pyenv import Pyenv
+from pex.third_party.packaging import tags
 from pex.third_party.pkg_resources import Distribution, Requirement
 from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING, cast, overload
@@ -31,14 +35,17 @@ from pex.variables import ENV
 
 if TYPE_CHECKING:
     from typing import (
+        Any,
+        AnyStr,
         Callable,
         Dict,
         Iterable,
         Iterator,
         List,
+        Mapping,
         MutableMapping,
         Optional,
-        Sequence,
+        Text,
         Tuple,
         Union,
     )
@@ -50,8 +57,20 @@ if TYPE_CHECKING:
 
     # N.B.: We convert InterpreterIdentificationJobErrors that result from spawning interpreter
     # identification jobs to these end-user InterpreterIdentificationErrors for display.
-    InterpreterIdentificationError = Tuple[str, str]
+    InterpreterIdentificationError = Tuple[str, Text]
     InterpreterOrError = Union["PythonInterpreter", InterpreterIdentificationError]
+
+
+def calculate_binary_name(
+    platform_python_implementation, python_version=None  # type: Optional[Tuple[int, ...]]
+):
+    # type: (...) -> str
+    name = "python"
+    if platform_python_implementation == "PyPy":
+        name = "pypy"
+    if not python_version:
+        return name
+    return "{name}{version}".format(name=name, version=".".join(map(str, python_version)))
 
 
 class PythonIdentity(object):
@@ -64,20 +83,20 @@ class PythonIdentity(object):
     class UnknownRequirement(Error):
         pass
 
-    # TODO(wickman)  Support interpreter-specific versions, e.g. PyPy-2.2.1
-    INTERPRETER_NAME_TO_HASHBANG = {
-        "CPython": "python%(major)d.%(minor)d",
-        "Jython": "jython",
-        "PyPy": "pypy",
-        "IronPython": "ipy",
-    }
-
     ABBR_TO_INTERPRETER_NAME = {
         "pp": "PyPy",
-        "jy": "Jython",
-        "ip": "IronPython",
         "cp": "CPython",
     }
+
+    @staticmethod
+    def _normalize_macosx_deployment_target(value):
+        # type: (Any) -> Optional[str]
+
+        # N.B.: Sometimes MACOSX_DEPLOYMENT_TARGET can be configured as a float.
+        # See: https://github.com/pantsbuild/pex/issues/1337
+        if value is None:
+            return None
+        return str(value)
 
     @classmethod
     def get(cls, binary=None):
@@ -95,29 +114,42 @@ class PythonIdentity(object):
 
         supported_tags = tuple(tags.sys_tags())
         preferred_tag = supported_tags[0]
+
+        configured_macosx_deployment_target = cls._normalize_macosx_deployment_target(
+            sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET")
+        )
+
+        # Pex identifies interpreters using a bit of Pex code injected via an extraction of that
+        # code under the `PEX_ROOT` adjoined to `sys.path` via `PYTHONPATH`. We ignore such adjoined
+        # `sys.path` entries to discover the true base interpreter `sys.path`.
+        pythonpath = frozenset(os.environ.get("PYTHONPATH", "").split(os.pathsep))
+        sys_path = [item for item in sys.path if item and item not in pythonpath]
+
         return cls(
             binary=binary or sys.executable,
             prefix=sys.prefix,
             base_prefix=(
                 # Old virtualenv (16 series and lower) sets `sys.real_prefix` in all cases.
-                getattr(sys, "real_prefix", None)
+                cast("Optional[str]", getattr(sys, "real_prefix", None))
                 # Both pyvenv and virtualenv 20+ set `sys.base_prefix` as per
                 # https://www.python.org/dev/peps/pep-0405/.
-                or getattr(sys, "base_prefix", sys.prefix)
+                or cast(str, getattr(sys, "base_prefix", sys.prefix))
             ),
+            sys_path=sys_path,
             python_tag=preferred_tag.interpreter,
             abi_tag=preferred_tag.abi,
             platform_tag=preferred_tag.platform,
             version=sys.version_info[:3],
             supported_tags=supported_tags,
-            env_markers=markers.default_environment(),
+            env_markers=MarkerEnvironment.default(),
+            configured_macosx_deployment_target=configured_macosx_deployment_target,
         )
 
     @classmethod
     def decode(cls, encoded):
         TRACER.log("creating PythonIdentity from encoded: %s" % encoded, V=9)
         values = json.loads(encoded)
-        if len(values) != 9:
+        if len(values) != 11:
             raise cls.InvalidError("Invalid interpreter identity: %s" % encoded)
 
         supported_tags = values.pop("supported_tags")
@@ -126,7 +158,19 @@ class PythonIdentity(object):
             for (interpreter, abi, platform) in supported_tags:
                 yield tags.Tag(interpreter=interpreter, abi=abi, platform=platform)
 
-        return cls(supported_tags=iter_tags(), **values)
+        # N.B.: Old encoded identities may have numeric values; so we support these and convert
+        # back to strings here as needed. See: https://github.com/pantsbuild/pex/issues/1337
+        configured_macosx_deployment_target = cls._normalize_macosx_deployment_target(
+            values.pop("configured_macosx_deployment_target")
+        )
+
+        env_markers = MarkerEnvironment(**values.pop("env_markers"))
+        return cls(
+            supported_tags=iter_tags(),
+            configured_macosx_deployment_target=configured_macosx_deployment_target,
+            env_markers=env_markers,
+            **values
+        )
 
     @classmethod
     def _find_interpreter_name(cls, python_tag):
@@ -140,33 +184,38 @@ class PythonIdentity(object):
         binary,  # type: str
         prefix,  # type: str
         base_prefix,  # type: str
+        sys_path,  # type: Iterable[str]
         python_tag,  # type: str
         abi_tag,  # type: str
         platform_tag,  # type: str
         version,  # type: Iterable[int]
         supported_tags,  # type: Iterable[tags.Tag]
-        env_markers,  # type: Dict[str, str]
+        env_markers,  # type: MarkerEnvironment
+        configured_macosx_deployment_target,  # type: Optional[str]
     ):
         # type: (...) -> None
-        # N.B.: We keep this mapping to support historical values for `distribution` and `requirement`
-        # properties.
+        # N.B.: We keep this mapping to support historical values for `distribution` and
+        # `requirement` properties.
         self._interpreter_name = self._find_interpreter_name(python_tag)
 
         self._binary = binary
         self._prefix = prefix
         self._base_prefix = base_prefix
+        self._sys_path = tuple(sys_path)
         self._python_tag = python_tag
         self._abi_tag = abi_tag
         self._platform_tag = platform_tag
         self._version = tuple(version)
-        self._supported_tags = tuple(supported_tags)
-        self._env_markers = dict(env_markers)
+        self._supported_tags = CompatibilityTags(tags=supported_tags)
+        self._env_markers = env_markers
+        self._configured_macosx_deployment_target = configured_macosx_deployment_target
 
     def encode(self):
         values = dict(
             binary=self._binary,
             prefix=self._prefix,
             base_prefix=self._base_prefix,
+            sys_path=self._sys_path,
             python_tag=self._python_tag,
             abi_tag=self._abi_tag,
             platform_tag=self._platform_tag,
@@ -174,7 +223,8 @@ class PythonIdentity(object):
             supported_tags=[
                 (tag.interpreter, tag.abi, tag.platform) for tag in self._supported_tags
             ],
-            env_markers=self._env_markers,
+            env_markers=self._env_markers.as_dict(),
+            configured_macosx_deployment_target=self._configured_macosx_deployment_target,
         )
         return json.dumps(values, sort_keys=True)
 
@@ -191,6 +241,11 @@ class PythonIdentity(object):
     def base_prefix(self):
         # type: () -> str
         return self._base_prefix
+
+    @property
+    def sys_path(self):
+        # type: () -> Tuple[str, ...]
+        return self._sys_path
 
     @property
     def python_tag(self):
@@ -220,11 +275,18 @@ class PythonIdentity(object):
 
     @property
     def supported_tags(self):
+        # type: () -> CompatibilityTags
         return self._supported_tags
 
     @property
     def env_markers(self):
-        return dict(self._env_markers)
+        # type: () -> MarkerEnvironment
+        return self._env_markers
+
+    @property
+    def configured_macosx_deployment_target(self):
+        # type: () -> Optional[str]
+        return self._configured_macosx_deployment_target
 
     @property
     def interpreter(self):
@@ -232,6 +294,7 @@ class PythonIdentity(object):
 
     @property
     def requirement(self):
+        # type: () -> Requirement
         return self.distribution.as_requirement()
 
     @property
@@ -243,11 +306,23 @@ class PythonIdentity(object):
         # type: () -> Iterator[Platform]
         """All platforms supported by the associated interpreter ordered from most specific to
         least."""
-        for tags in self._supported_tags:
-            yield Platform.from_tags(platform=tags.platform, python=tags.interpreter, abi=tags.abi)
+        yield Platform(
+            platform=self._platform_tag,
+            impl=self.python_tag[:2],
+            version=self.version_str,
+            version_info=self.version,
+            abi=self.abi_tag,
+        )
+        for tag in self._supported_tags:
+            yield Platform.from_tag(tag)
 
     @classmethod
-    def parse_requirement(cls, requirement, default_interpreter="CPython"):
+    def parse_requirement(
+        cls,
+        requirement,  # type: Union[Requirement, str]
+        default_interpreter="CPython",  # type: str
+    ):
+        # type: (...) -> Requirement
         if isinstance(requirement, Requirement):
             return requirement
         elif isinstance(requirement, string):
@@ -270,16 +345,22 @@ class PythonIdentity(object):
             raise self.UnknownRequirement(str(e))
         return self.distribution in requirement
 
+    def binary_name(self, version_components=2):
+        # type: (int) -> str
+        return calculate_binary_name(
+            platform_python_implementation=self._interpreter_name,
+            python_version=self._version[:version_components] if version_components > 0 else None,
+        )
+
     def hashbang(self):
         # type: () -> str
-        hashbang_string = self.INTERPRETER_NAME_TO_HASHBANG.get(
-            self._interpreter_name, "CPython"
-        ) % {
-            "major": self._version[0],
-            "minor": self._version[1],
-            "patch": self._version[2],
-        }
-        return "#!/usr/bin/env %s" % hashbang_string
+        return "#!/usr/bin/env {}".format(
+            self.binary_name(
+                version_components=0
+                if self._interpreter_name == "PyPy" and self.version[0] == 2
+                else 2
+            )
+        )
 
     @property
     def python(self):
@@ -327,16 +408,31 @@ class PythonIdentity(object):
 
 class PythonInterpreter(object):
     _REGEXEN = (
-        re.compile(r"jython$"),
-        # NB: OSX ships python binaries named Python so we allow for capital-P.
-        re.compile(r"[Pp]ython$"),
-        re.compile(r"python[23]$"),
-        re.compile(r"python[23].[0-9]$"),
-        # Some distributions include a suffix on the interpreter name, similar to PEP-3149.
-        # For example, Gentoo has /usr/bin/python3.6m to indicate it was built with pymalloc.
-        re.compile(r"python[23].[0-9][a-z]$"),
-        re.compile(r"pypy$"),
-        re.compile(r"pypy-1.[0-9]$"),
+        # NB: OSX ships python binaries named Python with a capital-P; so we allow for this.
+        re.compile(r"^Python$"),
+        re.compile(
+            r"""
+            ^
+            (?:
+                python |
+                pypy
+            )
+            (?:
+                # Major version
+                [2-9]
+                (?:.
+                    # Minor version
+                    [0-9]+
+                    # Some distributions include a suffix on the interpreter name, similar to
+                    # PEP-3149. For example, Gentoo has /usr/bin/python3.6m to indicate it was
+                    # built with pymalloc
+                    [a-z]?
+                )?
+            )?
+            $
+            """,
+            flags=re.VERBOSE,
+        ),
     )
 
     _PYTHON_INTERPRETER_BY_NORMALIZED_PATH = {}  # type: Dict
@@ -451,7 +547,7 @@ class PythonInterpreter(object):
 
     @staticmethod
     def latest_release_of_min_compatible_version(interps):
-        # type: (Sequence[PythonInterpreter]) -> PythonInterpreter
+        # type: (Iterable[PythonInterpreter]) -> PythonInterpreter
         """Find the minimum major version, but use the most recent micro version within that minor
         version.
 
@@ -464,6 +560,7 @@ class PythonInterpreter(object):
 
     @classmethod
     def get(cls):
+        # type: () -> PythonInterpreter
         return cls.from_binary(sys.executable)
 
     @staticmethod
@@ -498,7 +595,7 @@ class PythonInterpreter(object):
         :return: A heterogeneous iterator over valid interpreters and (python, error) invalid
                  python binary tuples.
         """
-        failed_interpreters = OrderedDict()  # type: MutableMapping[str, str]
+        failed_interpreters = OrderedDict()  # type: MutableMapping[str, Text]
 
         def iter_interpreters():
             # type: () -> Iterator[PythonInterpreter]
@@ -509,7 +606,7 @@ class PythonInterpreter(object):
                     yield candidate
                 else:
                     python, exception = cast("InterpreterIdentificationJobError", candidate)
-                    if isinstance(exception, Job.Error):
+                    if isinstance(exception, Job.Error) and exception.stderr:
                         # We spawned a subprocess to identify the interpreter but the interpreter
                         # could not run our identification code meaning the interpreter is either
                         # broken or old enough that it either can't parse our identification code
@@ -533,7 +630,14 @@ class PythonInterpreter(object):
         return list(cls.iter(paths=paths))
 
     @classmethod
-    def _create_isolated_cmd(cls, binary, args=None, pythonpath=None, env=None):
+    def _create_isolated_cmd(
+        cls,
+        binary,  # type: str
+        args=None,  # type: Optional[Iterable[str]]
+        pythonpath=None,  # type: Optional[Iterable[str]]
+        env=None,  # type: Optional[Mapping[str, str]]
+    ):
+        # type: (...) -> Tuple[Iterable[str], Mapping[str, str]]
         cmd = [binary]
 
         # Don't add the user site directory to `sys.path`.
@@ -560,17 +664,55 @@ class PythonInterpreter(object):
 
         return cmd, env
 
+    # We use () as the unset sentinel for this lazily calculated cached value. The cached value
+    # itself should always be Optional[Pyenv].
+    #
+    # N.B.: The empty tuple type is not represented as Tuple[] as you might naivly guess but
+    # instead as Tuple[()].
+    #
+    # See:
+    # + https://github.com/python/mypy/issues/4211
+    # + https://www.python.org/dev/peps/pep-0484/#the-typing-module
+    _PYENV = ()  # type: Union[Tuple[()],Optional[Pyenv]]
+
     @classmethod
-    def _execute(cls, binary, args=None, pythonpath=None, env=None, stdin_payload=None, **kwargs):
-        cmd, env = cls._create_isolated_cmd(binary, args=args, pythonpath=pythonpath, env=env)
-        stdout, stderr = Executor.execute(cmd, stdin_payload=stdin_payload, env=env, **kwargs)
-        return cmd, stdout, stderr
+    def _pyenv(cls):
+        # type: () -> Optional[Pyenv]
+        if isinstance(cls._PYENV, tuple):
+            cls._PYENV = Pyenv.find()
+        return cls._PYENV
+
+    @classmethod
+    def _resolve_pyenv_shim(
+        cls,
+        binary,  # type: str
+        pyenv=None,  # type: Optional[Pyenv]
+    ):
+        # type: (...) -> Optional[str]
+
+        pyenv = pyenv or cls._pyenv()
+        if pyenv is not None:
+            shim = pyenv.as_shim(binary)
+            if shim is not None:
+                python = shim.select_version()
+                if python is None:
+                    TRACER.log("Detected inactive pyenv shim: {}.".format(shim), V=3)
+                else:
+                    TRACER.log("Detected pyenv shim activated to {}: {}.".format(python, shim), V=3)
+                return python
+        return binary
 
     INTERP_INFO_FILE = "INTERP-INFO"
 
     @classmethod
     def _spawn_from_binary_external(cls, binary):
-        def create_interpreter(stdout, check_binary=False):
+        # type: (str) -> SpawnedJob[PythonInterpreter]
+
+        def create_interpreter(
+            stdout,  # type: bytes
+            check_binary=False,  # type: bool
+        ):
+            # type: (...) -> PythonInterpreter
             identity = stdout.decode("utf-8").strip()
             if not identity:
                 raise cls.IdentificationError("Could not establish identity of {}.".format(binary))
@@ -638,10 +780,11 @@ class PythonInterpreter(object):
 
 
                         encoded_identity = PythonIdentity.get(binary={binary!r}).encode()
-                        sys.stdout.write(encoded_identity)
                         with atomic_directory({cache_dir!r}, exclusive=False) as cache_dir:
-                            if cache_dir:
-                                with safe_open(os.path.join(cache_dir, {info_file!r}), 'w') as fp:
+                            if not cache_dir.is_finalized():
+                                with safe_open(
+                                    os.path.join(cache_dir.work_dir, {info_file!r}), 'w'
+                                ) as fp:
                                     fp.write(encoded_identity)
                         """.format(
                             binary=binary, cache_dir=cache_dir, info_file=cls.INTERP_INFO_FILE
@@ -650,11 +793,14 @@ class PythonInterpreter(object):
                 ],
                 pythonpath=pythonpath,
             )
+            # Ensure the `.` implicit PYTHONPATH entry contains no Pex code (of a different version)
+            # that might interfere with the behavior we expect in the script above.
+            cwd = safe_mkdtemp()
             process = Executor.open_process(
-                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd
             )
-            job = Job(command=cmd, process=process)
-            return SpawnedJob.stdout(job, result_func=create_interpreter)
+            job = Job(command=cmd, process=process, finalizer=lambda _: safe_rmtree(cwd))
+            return SpawnedJob.file(job, output_file=cache_file, result_func=create_interpreter)
 
     @classmethod
     def _expand_path(cls, path):
@@ -665,26 +811,37 @@ class PythonInterpreter(object):
         return []
 
     @classmethod
-    def from_env(cls, hashbang):
+    def from_env(
+        cls,
+        hashbang,  # type: str
+        paths=None,  # type: Optional[Iterable[str]]
+    ):
+        # type: (...) -> Optional[PythonInterpreter]
         """Resolve a PythonInterpreter as /usr/bin/env would.
 
-        :param hashbang: A string, e.g. "python3.3" representing some binary on the $PATH.
+        :param hashbang: A string, e.g. "python3.3" representing some binary on the search path.
+        :param paths: The search path to use; defaults to $PATH.
         :return: the first matching interpreter found or `None`.
-        :rtype: :class:`PythonInterpreter`
         """
 
         def hashbang_matches(fn):
             basefile = os.path.basename(fn)
             return hashbang == basefile
 
-        for interpreter in cls._identify_interpreters(filter=hashbang_matches):
+        for interpreter in cls._identify_interpreters(
+            filter=hashbang_matches, error_handler=None, paths=paths
+        ):
             return interpreter
+        return None
 
     @classmethod
     def _spawn_from_binary(cls, binary):
+        # type: (str) -> SpawnedJob[PythonInterpreter]
         canonicalized_binary = cls.canonicalize_path(binary)
         if not os.path.exists(canonicalized_binary):
-            raise cls.InterpreterNotFound(canonicalized_binary)
+            raise cls.InterpreterNotFound(
+                "The interpreter path {} does not exist.".format(canonicalized_binary)
+            )
 
         # N.B.: The cache is written as the last step in PythonInterpreter instance initialization.
         cached_interpreter = cls._PYTHON_INTERPRETER_BY_NORMALIZED_PATH.get(canonicalized_binary)
@@ -696,14 +853,27 @@ class PythonInterpreter(object):
         return cls._spawn_from_binary_external(canonicalized_binary)
 
     @classmethod
-    def from_binary(cls, binary):
-        # type: (str) -> PythonInterpreter
+    def from_binary(
+        cls,
+        binary,  # type: str
+        pyenv=None,  # type: Optional[Pyenv]
+    ):
+        # type: (...) -> PythonInterpreter
         """Create an interpreter from the given `binary`.
 
         :param binary: The path to the python interpreter binary.
+        :param pyenv: A custom Pyenv installation for handling pyenv shim identification.
+                      Auto-detected by default.
         :return: an interpreter created from the given `binary`.
         """
-        return cast(PythonInterpreter, cls._spawn_from_binary(binary).await_result())
+        python = cls._resolve_pyenv_shim(binary, pyenv=pyenv)
+        if python is None:
+            raise cls.IdentificationError("The pyenv shim at {} is not active.".format(binary))
+
+        try:
+            return cast(PythonInterpreter, cls._spawn_from_binary(python).await_result())
+        except Job.Error as e:
+            raise cls.IdentificationError("Failed to identify {}: {}".format(binary, e))
 
     @classmethod
     def _matches_binary_name(cls, path):
@@ -779,10 +949,12 @@ class PythonInterpreter(object):
             for path in cls._paths(paths=paths):
                 for fn in cls._expand_path(path):
                     if filter(fn):
-                        yield fn
+                        binary = cls._resolve_pyenv_shim(fn)
+                        if binary:
+                            yield binary
 
         results = execute_parallel(
-            inputs=list(iter_candidates()),
+            inputs=OrderedSet(iter_candidates()),
             spawn_func=cls._spawn_from_binary,
             error_handler=error_handler,
         )
@@ -816,9 +988,10 @@ class PythonInterpreter(object):
 
     @classmethod
     def _sanitized_environment(cls, env=None):
+        # type: (Optional[Mapping[str, str]]) -> Dict[str, str]
         # N.B. This is merely a hack because sysconfig.py on the default OS X
-        # installation of 2.7 breaks.
-        env_copy = (env or os.environ).copy()
+        # installation of 2.7 breaks. See: https://bugs.python.org/issue9516
+        env_copy = dict(env or os.environ)
         env_copy.pop("MACOSX_DEPLOYMENT_TARGET", None)
         return env_copy
 
@@ -854,6 +1027,17 @@ class PythonInterpreter(object):
         For virtual environments, this will be the virtual environment directory itself.
         """
         return self._identity.prefix
+
+    @property
+    def sys_path(self):
+        # type: () -> Tuple[str, ...]
+        """Return the interpreter's `sys.path`.
+
+        The implicit `$PWD` entry and any entries injected via PYTHONPATH or in the user site
+        directory are excluded such that the `sys.path` presented is the base interpreter `sys.path`
+        with no adornments.
+        """
+        return self._identity.sys_path
 
     class BaseInterpreterResolutionError(Exception):
         """Indicates the base interpreter for a virtual environment could not be resolved."""
@@ -960,10 +1144,8 @@ class PythonInterpreter(object):
 
     @property
     def platform(self):
-        """The most specific platform of this interpreter.
-
-        :rtype: :class:`Platform`
-        """
+        # type: () -> Platform
+        """The most specific platform of this interpreter."""
         return next(self._identity.iter_supported_platforms())
 
     @property
@@ -976,18 +1158,84 @@ class PythonInterpreter(object):
             self._supported_platforms = frozenset(self._identity.iter_supported_platforms())
         return self._supported_platforms
 
-    def execute(self, args=None, stdin_payload=None, pythonpath=None, env=None, **kwargs):
-        return self._execute(
-            self.binary,
-            args=args,
-            stdin_payload=stdin_payload,
-            pythonpath=pythonpath,
-            env=env,
-            **kwargs
+    def create_isolated_cmd(
+        self,
+        args=None,  # type: Optional[Iterable[str]]
+        pythonpath=None,  # type: Optional[Iterable[str]]
+        env=None,  # type: Optional[Mapping[str, str]]
+    ):
+        # type: (...) -> Tuple[Iterable[str], Mapping[str, str]]
+        env_copy = dict(env or os.environ)
+
+        if self._identity.configured_macosx_deployment_target:
+            # System interpreters on mac have a history of bad configuration from one source or
+            # another. See `cls._sanitized_environment` for one example of this.
+            #
+            # When a Python interpreter is used to build platform specific wheels on a mac, it needs
+            # to report a platform of `macosx-X.Y-<machine>` to conform to PEP-425 & PyPAs
+            # `packaging` tags library. The X.Y release is derived from the MACOSX_DEPLOYMENT_TARGET
+            # sysconfig (Makefile) variable. Sometimes the configuration is provided by a user
+            # building a custom Python. See https://github.com/pypa/wheel/issues/385 for an example
+            # where MACOSX_DEPLOYMENT_TARGET is set to 11. Other times the configuration is provided
+            # by the system maintainer (Apple). See https://github.com/pantsbuild/pants/issues/11061
+            # for an example of this via XCode 12s system Python 3.8 interpreter which reports
+            # 10.14.6.
+            release = self._identity.configured_macosx_deployment_target
+            version = release.split(".")
+            if len(version) == 1:
+                release = "{}.0".format(version[0])
+            elif len(version) > 2:
+                release = ".".join(version[:2])
+
+            if release != self._identity.configured_macosx_deployment_target:
+                osname, _, machine = sysconfig.get_platform().split("-")
+                pep425_compatible_platform = "{osname}-{release}-{machine}".format(
+                    osname=osname, release=release, machine=machine
+                )
+                # An undocumented feature of `sysconfig.get_platform()` is respect for the
+                # _PYTHON_HOST_PLATFORM environment variable. We can fix up badly configured macOS
+                # interpreters by influencing the platform this way, which is enough to get wheels
+                # building with proper platform tags. This is supported for the CPythons we support:
+                # + https://github.com/python/cpython/blob/v2.7.18/Lib/sysconfig.py#L567-L569
+                # ... through ...
+                # + https://github.com/python/cpython/blob/v3.9.2/Lib/sysconfig.py#L652-L654
+                TRACER.log(
+                    "Correcting mis-configured MACOSX_DEPLOYMENT_TARGET of {} to {} corresponding "
+                    "to a valid PEP-425 platform of {} for {}.".format(
+                        self._identity.configured_macosx_deployment_target,
+                        release,
+                        pep425_compatible_platform,
+                        self,
+                    )
+                )
+                env_copy.update(_PYTHON_HOST_PLATFORM=pep425_compatible_platform)
+
+        return self._create_isolated_cmd(
+            self.binary, args=args, pythonpath=pythonpath, env=env_copy
         )
 
-    def open_process(self, args=None, pythonpath=None, env=None, **kwargs):
-        cmd, env = self._create_isolated_cmd(self.binary, args=args, pythonpath=pythonpath, env=env)
+    def execute(
+        self,
+        args=None,  # type: Optional[Iterable[str]]
+        stdin_payload=None,  # type: Optional[AnyStr]
+        pythonpath=None,  # type: Optional[Iterable[str]]
+        env=None,  # type: Optional[Mapping[str, str]]
+        **kwargs  # type: Any
+    ):
+        # type: (...) -> Tuple[Iterable[str], str, str]
+        cmd, env = self.create_isolated_cmd(args=args, pythonpath=pythonpath, env=env)
+        stdout, stderr = Executor.execute(cmd, stdin_payload=stdin_payload, env=env, **kwargs)
+        return cmd, stdout, stderr
+
+    def open_process(
+        self,
+        args=None,  # type: Optional[Iterable[str]]
+        pythonpath=None,  # type: Optional[Iterable[str]]
+        env=None,  # type: Optional[Mapping[str, str]]
+        **kwargs  # type: Any
+    ):
+        # type: (...) -> Tuple[Iterable[str], subprocess.Popen]
+        cmd, env = self.create_isolated_cmd(args=args, pythonpath=pythonpath, env=env)
         process = Executor.open_process(cmd, env=env, **kwargs)
         return cmd, process
 
@@ -1006,38 +1254,36 @@ class PythonInterpreter(object):
 
 
 def spawn_python_job(
-    args, env=None, interpreter=None, expose=None, pythonpath=None, **subprocess_kwargs
+    args,  # type: Iterable[str]
+    env=None,  # type: Optional[Mapping[str, str]]
+    interpreter=None,  # type: Optional[PythonInterpreter]
+    expose=None,  # type: Optional[Iterable[str]]
+    pythonpath=None,  # type: Optional[Iterable[str]]
+    **subprocess_kwargs  # type: Any
 ):
+    # type: (...) -> Job
     """Spawns a python job.
 
     :param args: The arguments to pass to the python interpreter.
-    :type args: list of str
     :param env: The environment to spawn the python interpreter process in. Defaults to the ambient
                 environment.
-    :type env: dict of (str, str)
     :param interpreter: The interpreter to use to spawn the python job. Defaults to the current
                         interpreter.
-    :type interpreter: :class:`PythonInterpreter`
     :param expose: The names of any vendored distributions to expose to the spawned python process.
                    These will be appended to `pythonpath` if passed.
-    :type expose: list of str
     :param pythonpath: The PYTHONPATH to expose to the spawned python process. These will be
                        pre-pended to the `expose` path if passed.
-    :type pythonpath: list of str
     :param subprocess_kwargs: Any additional :class:`subprocess.Popen` kwargs to pass through.
     :returns: A job handle to the spawned python process.
-    :rtype: :class:`Job`
     """
     pythonpath = list(pythonpath or ())
+    subprocess_env = dict(env or os.environ)
     if expose:
-        subprocess_env = (env or os.environ).copy()
         # In order to expose vendored distributions with their un-vendored import paths in-tact, we
         # need to set `__PEX_UNVENDORED__`. See: vendor.__main__.ImportRewriter._modify_import.
         subprocess_env["__PEX_UNVENDORED__"] = "1"
 
         pythonpath.extend(third_party.expose(expose))
-    else:
-        subprocess_env = env
 
     interpreter = interpreter or PythonInterpreter.get()
     cmd, process = interpreter.open_process(

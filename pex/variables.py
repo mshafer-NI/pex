@@ -7,21 +7,27 @@
 from __future__ import absolute_import
 
 import hashlib
+import json
 import os
+import re
 import sys
 from contextlib import contextmanager
+from textwrap import dedent
 
 from pex import pex_warnings
 from pex.common import can_write_dir, die, safe_mkdtemp
 from pex.inherit_path import InheritPath
 from pex.typing import TYPE_CHECKING, Generic, overload
-from pex.venv_bin_path import BinPath
+from pex.venv.bin_path import BinPath
 
 if TYPE_CHECKING:
-    from typing import Callable, Dict, Iterable, Iterator, Optional, Tuple, TypeVar, Type, Union
+    from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Type, TypeVar, Union
 
     _O = TypeVar("_O")
     _P = TypeVar("_P")
+
+    # N.B.: This is an expensive import and we only need it for type checking.
+    from pex.interpreter import PythonInterpreter
 
 
 class NoValueError(Exception):
@@ -213,6 +219,23 @@ class Variables(object):
             rc_values.update(self._environ)
             self._environ = rc_values
 
+        if "PEX_ALWAYS_CACHE" in self._environ:
+            pex_warnings.warn(
+                "The `PEX_ALWAYS_CACHE` env var is deprecated. This env var is no longer read; all "
+                "internally cached distributions in a PEX are always installed into the local Pex "
+                "dependency cache."
+            )
+        if "PEX_FORCE_LOCAL" in self._environ:
+            pex_warnings.warn(
+                "The `PEX_FORCE_LOCAL` env var is deprecated. This env var is no longer read since "
+                "user code is now always unzipped before execution."
+            )
+        if "PEX_UNZIP" in self._environ:
+            pex_warnings.warn(
+                "The `PEX_UNZIP` env var is deprecated. This env var is no longer read since "
+                "unzipping PEX zip files before execution is now the default."
+            )
+
     def copy(self):
         # type: () -> Dict[str, str]
         return self._environ.copy()
@@ -280,25 +303,43 @@ class Variables(object):
 
     @contextmanager
     def patch(self, **kw):
-        # type: (**str) -> Iterator[Dict[str, str]]
-        """Update the environment for the duration of a context."""
+        # type: (**Optional[str]) -> Iterator[Dict[str, str]]
+        """Update the environment for the duration of a context.
+
+        Any environment variable with a value of `None` will be removed from the environment if
+        present. The rest will be added to the environment or else updated if already present in
+        the environment.
+        """
         old_environ = self._environ
         self._environ = self._environ.copy()
-        self._environ.update(kw)
+        for k, v in kw.items():
+            if v is None:
+                self._environ.pop(k, None)
+            else:
+                self._environ[k] = v
         yield self._environ
         self._environ = old_environ
+
+    @property
+    def PEX(self):
+        # type: () -> Optional[str]
+        """String.
+
+        The absolute path of the PEX that is executing. This will either be the path of the PEX
+        zip for zipapps or else the path of the PEX loose directory for packed or loose PEXes.
+
+        N.B.: The path is not the path of the underlying unzipped PEX or else the PEXes installed
+        venv.
+        """
+        return self._maybe_get_path("PEX")
 
     @defaulted_property(default=False)
     def PEX_ALWAYS_CACHE(self):
         # type: () -> bool
         """Boolean.
 
-        Always write PEX dependencies to disk prior to invoking regardless whether or not the
-        dependencies are zip-safe.  For certain dependencies that are very large such as numpy, this
-        can reduce the RAM necessary to launch the PEX.  The data will be written into $PEX_ROOT,
-        which by default is $HOME/.pex.
-
-        Default: false.
+        Deprecated: This env var is no longer used; all internally cached distributions in a PEX
+        are always installed into the local Pex dependency cache.
         """
         return self._get_bool("PEX_ALWAYS_CACHE")
 
@@ -329,13 +370,8 @@ class Variables(object):
         # type: () -> bool
         """Boolean.
 
-        Force this PEX to be not-zip-safe. This forces all code and dependencies to be written into
-        $PEX_ROOT prior to invocation.  This is an option for applications with static assets that
-        refer to paths relative to __file__ instead of using pkgutil/pkg_resources.  Also see
-        PEX_UNZIP which will cause the complete PEX file to be unzipped and re-executed which can
-        often improve startup latency in addition to providing support for __file__ access.
-
-        Default: false.
+        Deprecated: This env var is no longer used since user code is now always unzipped before
+        execution.
         """
         return self._get_bool("PEX_FORCE_LOCAL")
 
@@ -344,11 +380,8 @@ class Variables(object):
         # type: () -> bool
         """Boolean.
 
-        Force this PEX to unzip itself to $PEX_ROOT and re-execute from there.  If the pex file will
-        be run multiple times under a stable $PEX_ROOT the unzipping will only be performed once and
-        subsequent runs will enjoy lower startup latency.
-
-        Default: false.
+        Deprecated: This env var is no longer used since unzipping PEX zip files before execution
+        is now the default.
         """
         return self._get_bool("PEX_UNZIP")
 
@@ -511,7 +544,7 @@ class Variables(object):
         """
         return self._maybe_get_string("PEX_EXTRA_SYS_PATH")
 
-    @defaulted_property(default=os.path.expanduser("~/.pex"))
+    @defaulted_property(default="~/.pex")
     def PEX_ROOT(self):
         # type: () -> str
         """Directory.
@@ -524,7 +557,8 @@ class Variables(object):
         return self._get_path("PEX_ROOT")
 
     @PEX_ROOT.validator
-    def _ensure_writeable_pex_root(self, pex_root):
+    def _ensure_writeable_pex_root(self, raw_pex_root):
+        pex_root = os.path.expanduser(raw_pex_root)
         if not can_write_dir(pex_root):
             tmp_root = os.path.realpath(safe_mkdtemp())
             pex_warnings.warn(
@@ -646,23 +680,127 @@ def unzip_dir(
 
 
 def venv_dir(
+    pex_file,  # type: str
     pex_root,  # type: str
     pex_hash,  # type: str
-    interpreter_constraints,  # type: Iterable[str]
+    has_interpreter_constraints,  # type: bool
+    interpreter=None,  # type: Optional[PythonInterpreter]
+    pex_path=None,  # type: Optional[str]
 ):
     # type: (...) -> str
-    hasher = hashlib.sha1()
-    hasher.update(
-        "interpreter_constraints:{}".format(" or ".join(sorted(interpreter_constraints))).encode(
-            "utf-8"
+
+    # The venv contents are affected by which PEX files are in play as well as which interpreter
+    # is selected. The former is influenced via PEX_PATH and the latter is influenced by interpreter
+    # constraints, PEX_PYTHON and PEX_PYTHON_PATH.
+
+    pex_path_contents = {}  # type: Dict[str, Dict[str, str]]
+    venv_contents = {"pex_path": pex_path_contents}  # type: Dict[str, Any]
+
+    # PexInfo.pex_path and PEX_PATH are merged by PEX at runtime, so we include both and hash just
+    # the distributions since those are the only items used from PEX_PATH adjoined PEX files; i.e.:
+    # neither the entry_point nor any other PEX file data or metadata is used.
+    def add_pex_path_items(path):
+        # type: (Optional[str]) -> None
+        if not path:
+            return
+        from pex.pex_info import PexInfo
+
+        for pex in path.split(":"):
+            pex_path_contents[pex] = PexInfo.from_pex(pex).distributions
+
+    add_pex_path_items(pex_path)
+    add_pex_path_items(ENV.PEX_PATH)
+
+    # There are two broad cases of interpreter selection, Pex chooses and user chooses. For the
+    # former we hash Pex's selection criteria and for the latter we write down the actual
+    # interpreter the user selected. N.B.: The pex_hash already includes an encoding of the
+    # interpreter constraints, if any; so we don't hash those here again for the Pex chooses case.
+
+    # This is relevant in all cases of interpreter selection and restricts the valid search path
+    # for interpreter constraints, PEX_PYTHON and otherwise unconstrained PEXes.
+    venv_contents["PEX_PYTHON_PATH"] = ENV.PEX_PYTHON_PATH
+
+    interpreter_path = None  # type: Optional[str]
+    precise_pex_python = ENV.PEX_PYTHON and os.path.exists(ENV.PEX_PYTHON)
+    if precise_pex_python:
+        # If there are interpreter_constraints and this interpreter doesn't meet them, then this
+        # venv hash will never be used; so it's OK to hash based on the interpreter.
+        interpreter_path = ENV.PEX_PYTHON
+    elif ENV.PEX_PYTHON:
+        # For an imprecise PEX_PYTHON that requires PATH lookup, PEX_PYTHON=python3.7, for example,
+        # we just write down the constraint and let the PEX runtime determine the path of an
+        # appropriate python3.7, if any (Pex chooses).
+        venv_contents["PEX_PYTHON"] = ENV.PEX_PYTHON
+    elif not has_interpreter_constraints:
+        # Otherwise we can calculate the exact interpreter the PEX runtime will use. This ensures
+        # ~unconstrained PEXes get a venv per interpreter used to invoke them with (user chooses).
+        interpreter_binary = interpreter.binary if interpreter else sys.executable
+        pex_python_path = tuple(ENV.PEX_PYTHON_PATH.split(":")) if ENV.PEX_PYTHON_PATH else None
+        if (
+            not pex_python_path
+            or interpreter_binary.startswith(pex_python_path)
+            or os.path.realpath(interpreter_binary).startswith(pex_python_path)
+        ):
+            interpreter_path = interpreter_binary
+    if interpreter_path:
+        venv_contents["interpreter"] = os.path.realpath(interpreter_path)
+
+    venv_contents_hash = hashlib.sha1(
+        json.dumps(venv_contents, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    venv_path = os.path.join(_expand_pex_root(pex_root), "venvs", pex_hash, venv_contents_hash)
+
+    def warn(message):
+        # type: (str) -> None
+        from pex.pex_info import PexInfo
+
+        pex_warnings.configure_warnings(ENV, PexInfo.from_pex(pex_file))
+        pex_warnings.warn(message)
+
+    if (
+        ENV.PEX_PYTHON
+        and not precise_pex_python
+        and not re.match(r".*[^\d][\d]+\.[\d+]$", ENV.PEX_PYTHON)
+    ):
+        warn(
+            dedent(
+                """\
+                Using a venv selected by PEX_PYTHON={pex_python} for {pex_file} at {venv_path}.
+
+                If `{pex_python}` is upgraded or downgraded at some later date, this venv will still
+                be used. To force re-creation of the venv using the upgraded or downgraded
+                `{pex_python}` you will need to delete it at that point in time.
+
+                To avoid this warning, either specify a Python binary with major and minor version
+                in its name, like PEX_PYTHON=python{current_python_version} or else re-build the PEX
+                with `--no-emit-warnings` or re-run the PEX with PEX_EMIT_WARNINGS=False.
+                """.format(
+                    pex_python=ENV.PEX_PYTHON,
+                    pex_file=os.path.normpath(pex_file),
+                    venv_path=venv_path,
+                    current_python_version=".".join(map(str, sys.version_info[:2])),
+                )
+            )
         )
-    )
-    hasher.update("PEX_PYTHON:{}".format(ENV.PEX_PYTHON).encode("utf-8"))
-    hasher.update("PEX_PYTHON_PATH:{}".format(ENV.PEX_PYTHON_PATH).encode("utf-8"))
-    interpreter_selection_hash = hasher.hexdigest()
-    return os.path.join(
-        _expand_pex_root(pex_root),
-        "venvs",
-        pex_hash,
-        interpreter_selection_hash,
-    )
+    if not interpreter_path and ENV.PEX_PYTHON_PATH:
+        warn(
+            dedent(
+                """\
+                Using a venv restricted by PEX_PYTHON_PATH={ppp} for {pex_file} at {venv_path}.
+
+                If the contents of `{ppp}` changes at some later date, this venv and the interpreter
+                selected from `{ppp}` will still be used. To force re-creation of the venv using
+                the new pythons available on `{ppp}` you will need to delete it at that point in
+                time.
+
+                To avoid this warning, re-build the PEX with `--no-emit-warnings` or re-run the PEX
+                with PEX_EMIT_WARNINGS=False.
+                """
+            ).format(
+                ppp=ENV.PEX_PYTHON_PATH,
+                pex_file=os.path.normpath(pex_file),
+                venv_path=venv_path,
+            )
+        )
+
+    return venv_path

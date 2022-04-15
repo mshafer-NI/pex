@@ -4,28 +4,31 @@
 from __future__ import absolute_import
 
 import logging
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
 
 from pex import pex_bootstrapper
+from pex.commands.command import JsonMixin, OutputMixin
 from pex.interpreter import PythonInterpreter
 from pex.interpreter_constraints import UnsatisfiableInterpreterConstraintsError
 from pex.pex import PEX
-from pex.tools.command import Command, Error, JsonMixin, Ok, OutputMixin, Result
+from pex.result import Error, Ok, Result
+from pex.tools.command import PEXCommand
 from pex.typing import TYPE_CHECKING
 from pex.variables import ENV
 
 if TYPE_CHECKING:
-    from typing import Iterator
+    from typing import Any, Dict, Iterator
 
 logger = logging.getLogger(__name__)
 
 
-class Interpreter(JsonMixin, OutputMixin, Command):
+class Interpreter(JsonMixin, OutputMixin, PEXCommand):
     """Prints the path of the preferred interpreter to run the given PEX file with, if any."""
 
-    def add_arguments(self, parser):
+    @classmethod
+    def add_arguments(cls, parser):
         # type: (ArgumentParser) -> None
-        self.add_output_option(parser, entity="Python interpreter path"),
+        cls.add_output_option(parser, entity="Python interpreter path"),
         parser.add_argument(
             "-a",
             "--all",
@@ -35,18 +38,22 @@ class Interpreter(JsonMixin, OutputMixin, Command):
         parser.add_argument(
             "-v",
             "--verbose",
-            action="store_true",
-            help="Print the interpreter requirement in addition to it's path.",
+            action="count",
+            default=0,
+            help=(
+                "Provide more information about the interpreter in json format. "
+                "Once: include the interpreter requirement and platform in addition to its path. "
+                "Twice: include the interpreter's supported tags. "
+                "Thrice: include the interpreter's environment markers and its venv affiliation, "
+                "if any."
+            ),
         )
-        self.add_json_options(parser, entity="verbose output"),
+        cls.add_json_options(parser, entity="verbose output")
+        cls.register_global_arguments(parser, include_verbosity=False)
 
-    @staticmethod
-    def _find_interpreters(
-        pex,  # type: PEX
-        all=False,  # type: bool
-    ):
-        # type: (...) -> Iterator[PythonInterpreter]
-        if not all:
+    def _find_interpreters(self, pex):
+        # type: (PEX) -> Iterator[PythonInterpreter]
+        if not self.options.all:
             yield pex.interpreter
             return
 
@@ -61,29 +68,37 @@ class Interpreter(JsonMixin, OutputMixin, Command):
         ):
             yield interpreter
 
-    def run(
-        self,
-        pex,  # type: PEX
-        options,  # type: Namespace
-    ):
-        # type: (...) -> Result
-        if options.indent and not options.verbose:
+    def run(self, pex):
+        # type: (PEX) -> Result
+        if self.options.indent and not self.options.verbose:
             logger.warning(
-                "Ignoring --indent={} since --verbose mode is not enabled.".format(options.indent)
+                "Ignoring --indent={} since --verbose mode is not enabled.".format(
+                    self.options.indent
+                )
             )
-        with self.output(options) as out:
+        with self.output(self.options) as out:
             try:
-                for interpreter in self._find_interpreters(pex, all=options.all):
-                    if options.verbose:
-                        self.dump_json(
-                            options,
-                            {
-                                "path": interpreter.binary,
-                                "requirement": str(interpreter.identity.requirement),
-                                "platform": str(interpreter.platform),
-                            },
-                            out,
-                        )
+                for interpreter in self._find_interpreters(pex):
+                    if self.options.verbose:
+                        interpreter_info = {
+                            "path": interpreter.binary,
+                            "requirement": str(interpreter.identity.requirement),
+                            "platform": str(interpreter.platform),
+                        }  # type: Dict[str, Any]
+                        if self.options.verbose >= 2:
+                            interpreter_info[
+                                "supported_tags"
+                            ] = interpreter.identity.supported_tags.to_string_list()
+                        if self.options.verbose >= 3:
+                            interpreter_info[
+                                "env_markers"
+                            ] = interpreter.identity.env_markers.as_dict()
+                            interpreter_info["venv"] = interpreter.is_venv
+                            if interpreter.is_venv:
+                                interpreter_info[
+                                    "base_interpreter"
+                                ] = interpreter.resolve_base_interpreter().binary
+                        self.dump_json(self.options, interpreter_info, out)
                     else:
                         out.write(interpreter.binary)
                     out.write("\n")

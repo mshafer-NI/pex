@@ -4,6 +4,7 @@
 from __future__ import absolute_import, print_function
 
 import contextlib
+import itertools
 import os
 import platform
 import random
@@ -12,15 +13,23 @@ import sys
 from contextlib import contextmanager
 from textwrap import dedent
 
-from pex.common import open_zip, safe_mkdir, safe_mkdtemp, safe_rmtree, temporary_dir, touch
+from pex.common import (
+    atomic_directory,
+    open_zip,
+    safe_mkdir,
+    safe_mkdtemp,
+    safe_rmtree,
+    safe_sleep,
+    temporary_dir,
+)
 from pex.compatibility import to_unicode
-from pex.distribution_target import DistributionTarget
 from pex.executor import Executor
 from pex.interpreter import PythonInterpreter
 from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
 from pex.pex_info import PexInfo
-from pex.pip import get_pip
+from pex.pip.tool import get_pip
+from pex.targets import LocalInterpreter
 from pex.third_party.pkg_resources import Distribution
 from pex.typing import TYPE_CHECKING
 from pex.util import DistributionHelper, named_temporary_file
@@ -41,14 +50,19 @@ if TYPE_CHECKING:
         Union,
     )
 
+    import attr  # vendor:skip
+else:
+    from pex.third_party import attr
+
 PY_VER = sys.version_info[:2]
 IS_PYPY = hasattr(sys, "pypy_version_info")
+IS_PYPY2 = IS_PYPY and sys.version_info[0] == 2
+IS_PYPY3 = IS_PYPY and sys.version_info[0] == 3
 NOT_CPYTHON27 = IS_PYPY or PY_VER != (2, 7)
-NOT_CPYTHON36 = IS_PYPY or PY_VER != (3, 6)
 IS_LINUX = platform.system() == "Linux"
+IS_MAC = platform.system() == "Darwin"
 IS_NOT_LINUX = not IS_LINUX
 NOT_CPYTHON27_OR_OSX = NOT_CPYTHON27 or IS_NOT_LINUX
-NOT_CPYTHON36_OR_LINUX = NOT_CPYTHON36 or IS_LINUX
 
 
 @contextlib.contextmanager
@@ -111,6 +125,7 @@ def make_project(
     extras_require=None,  # type: Optional[Dict[str, List[str]]]
     entry_points=None,  # type: Optional[Union[str, Dict[str, List[str]]]]
     python_requires=None,  # type: Optional[str]
+    universal=False,  # type: bool
 ):
     # type: (...) -> Iterator[str]
     project_content = {
@@ -132,11 +147,12 @@ def make_project(
             extras_require=%(extras_require)r,
             entry_points=%(entry_points)r,
             python_requires=%(python_requires)r,
+            options={'bdist_wheel': {'universal': %(universal)r}},
             )
             """
         ),
-        "scripts/hello_world": '#!/usr/bin/env python\nprint("hello world!")\n',
-        "scripts/shell_script": "#!/usr/bin/env bash\necho hello world\n",
+        "scripts/hello_world": '#!/usr/bin/env python\nprint("hello world from py script!")\n',
+        "scripts/shell_script": "#!/usr/bin/env bash\necho hello world from shell script\n",
         os.path.join(name, "__init__.py"): 0,
         os.path.join(name, "my_module.py"): 'def do_something():\n  print("hello world!")\n',
         os.path.join(name, "package_data/resource1.dat"): 1000,
@@ -151,6 +167,7 @@ def make_project(
         "extras_require": extras_require or {},
         "entry_points": entry_points or {},
         "python_requires": python_requires,
+        "universal": universal,
     }
 
     with temporary_content(project_content, interp=interp) as td:
@@ -163,19 +180,27 @@ class WheelBuilder(object):
     class BuildFailure(Exception):
         pass
 
-    def __init__(self, source_dir, interpreter=None, wheel_dir=None):
-        # type: (str, Optional[PythonInterpreter], Optional[str]) -> None
+    def __init__(
+        self,
+        source_dir,  # type: str
+        interpreter=None,  # type: Optional[PythonInterpreter]
+        wheel_dir=None,  # type: Optional[str]
+        verify=True,  # type: bool
+    ):
+        # type: (...) -> None
         """Create a wheel from an unpacked source distribution in source_dir."""
         self._source_dir = source_dir
         self._wheel_dir = wheel_dir or safe_mkdtemp()
         self._interpreter = interpreter or PythonInterpreter.get()
+        self._verify = verify
 
     def bdist(self):
         # type: () -> str
-        get_pip().spawn_build_wheels(
+        get_pip(interpreter=self._interpreter).spawn_build_wheels(
             distributions=[self._source_dir],
             wheel_dir=self._wheel_dir,
             interpreter=self._interpreter,
+            verify=self._verify,
         ).wait()
         dists = os.listdir(self._wheel_dir)
         if len(dists) == 0:
@@ -192,8 +217,10 @@ def built_wheel(
     zip_safe=True,  # type: bool
     install_reqs=None,  # type: Optional[List[str]]
     extras_require=None,  # type: Optional[Dict[str, List[str]]]
+    entry_points=None,  # type: Optional[Union[str, Dict[str, List[str]]]]
     interpreter=None,  # type: Optional[PythonInterpreter]
     python_requires=None,  # type: Optional[str]
+    universal=False,  # type: bool
     **kwargs  # type: Any
 ):
     # type: (...) -> Iterator[str]
@@ -203,7 +230,9 @@ def built_wheel(
         zip_safe=zip_safe,
         install_reqs=install_reqs,
         extras_require=extras_require,
+        entry_points=entry_points,
         python_requires=python_requires,
+        universal=universal,
     ) as td:
         builder = WheelBuilder(td, interpreter=interpreter, **kwargs)
         yield builder.bdist()
@@ -237,10 +266,10 @@ def make_bdist(
     ) as dist_location:
 
         install_dir = os.path.join(safe_mkdtemp(), os.path.basename(dist_location))
-        get_pip().spawn_install_wheel(
+        get_pip(interpreter=interpreter).spawn_install_wheel(
             wheel=dist_location,
             install_dir=install_dir,
-            target=DistributionTarget.for_interpreter(interpreter),
+            target=LocalInterpreter.create(interpreter),
         ).wait()
         dist = DistributionHelper.distribution_from_path(install_dir)
         assert dist is not None
@@ -309,16 +338,13 @@ def write_simple_pex(
     return pb
 
 
-# TODO(#1041): use `typing.NamedTuple` once we require Python 3.
+@attr.s(frozen=True)
 class IntegResults(object):
     """Convenience object to return integration run results."""
 
-    def __init__(self, output, error, return_code):
-        # type: (str, str, int) -> None
-        super(IntegResults, self).__init__()
-        self.output = output
-        self.error = error
-        self.return_code = return_code
+    output = attr.ib()  # type: Text
+    error = attr.ib()  # type: Text
+    return_code = attr.ib()  # type: int
 
     def assert_success(self):
         # type: () -> None
@@ -333,18 +359,34 @@ class IntegResults(object):
         assert self.return_code != 0
 
 
-def run_pex_command(args, env=None, python=None, quiet=False):
-    # type: (Iterable[str], Optional[Dict[str, str]], Optional[str], bool) -> IntegResults
+def create_pex_command(
+    args=None,  # type: Optional[Iterable[str]]
+    python=None,  # type: Optional[str]
+    quiet=False,  # type: bool
+):
+    # type: (...) -> List[str]
+    cmd = [python or sys.executable, "-mpex"]
+    if not quiet:
+        cmd.append("-vvvvv")
+    if args:
+        cmd.extend(args)
+    return cmd
+
+
+def run_pex_command(
+    args,  # type: Iterable[str]
+    env=None,  # type: Optional[Dict[str, str]]
+    python=None,  # type: Optional[str]
+    quiet=False,  # type: bool
+):
+    # type: (...) -> IntegResults
     """Simulate running pex command for integration testing.
 
     This is different from run_simple_pex in that it calls the pex command rather than running a
     generated pex.  This is useful for testing end to end runs with specific command line arguments
     or env options.
     """
-    cmd = [python or sys.executable, "-mpex"]
-    if not quiet:
-        cmd.append("-vvvvv")
-    cmd.extend(args)
+    cmd = create_pex_command(args, python=python, quiet=quiet)
     process = Executor.open_process(
         cmd=cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -391,7 +433,6 @@ def run_simple_pex_test(
 
 def bootstrap_python_installer(dest):
     # type: (str) -> None
-    safe_rmtree(dest)
     for _ in range(3):
         try:
             subprocess.check_call(["git", "clone", "https://github.com/pyenv/pyenv.git", dest])
@@ -402,56 +443,31 @@ def bootstrap_python_installer(dest):
             break
     else:
         raise RuntimeError("Helper method could not clone pyenv from git after 3 tries")
-    # Create an empty file indicating the fingerprint of the correct set of test interpreters.
-    touch(os.path.join(dest, _INTERPRETER_SET_FINGERPRINT))
 
 
 # NB: We keep the pool of bootstrapped interpreters as small as possible to avoid timeouts in CI
 # otherwise encountered when fetching and building too many on a cache miss. In the past we had
 # issues with the combination of 7 total unique interpreter versions and a Travis-CI timeout of 50
 # minutes for a shard.
-PY27 = "2.7.15"
-PY35 = "3.5.6"
-PY36 = "3.6.6"
+PY27 = "2.7.18"
+PY37 = "3.7.11"
+PY310 = "3.10.1"
 
-_ALL_PY_VERSIONS = (PY27, PY35, PY36)
-_ALL_PY3_VERSIONS = (PY35, PY36)
-
-# This is the filename of a sentinel file that sits in the pyenv root directory.
-# Its purpose is to indicate whether pyenv has the correct interpreters installed
-# and will be useful for indicating whether we should trigger a reclone to update
-# pyenv.
-_INTERPRETER_SET_FINGERPRINT = "_".join(_ALL_PY_VERSIONS) + "_pex_fingerprint"
-
-
-_ROOT_DIR = None  # type: Optional[str]
-
-
-def root_dir():
-    # type: () -> str
-    global _ROOT_DIR
-    if _ROOT_DIR is None:
-        cwd = os.getcwd()
-        try:
-            os.chdir(os.path.dirname(__file__))
-            _ROOT_DIR = str(
-                os.path.realpath(
-                    subprocess.check_output(["git", "rev-parse", "--show-toplevel"])
-                    .decode("utf-8")
-                    .strip()
-                )
-            )
-        finally:
-            os.chdir(cwd)
-    return _ROOT_DIR
+ALL_PY_VERSIONS = (PY27, PY37, PY310)
+_ALL_PY3_VERSIONS = (PY37, PY310)
 
 
 def ensure_python_distribution(version):
     # type: (str) -> Tuple[str, str, Callable[[Iterable[str]], Text]]
-    if version not in _ALL_PY_VERSIONS:
-        raise ValueError("Please constrain version to one of {}".format(_ALL_PY_VERSIONS))
+    if version not in ALL_PY_VERSIONS:
+        raise ValueError("Please constrain version to one of {}".format(ALL_PY_VERSIONS))
 
-    pyenv_root = os.path.join(root_dir(), ".pyenv_test")
+    pyenv_root = os.path.abspath(
+        os.path.join(
+            os.path.expanduser(os.environ.get("_PEX_TEST_PYENV_ROOT", "~/.pex_dev")),
+            "pyenv",
+        )
+    )
     interpreter_location = os.path.join(pyenv_root, "versions", version)
 
     pyenv = os.path.join(pyenv_root, "bin", "pyenv")
@@ -460,17 +476,42 @@ def ensure_python_distribution(version):
 
     pip = os.path.join(interpreter_location, "bin", "pip")
 
-    if not os.path.exists(os.path.join(pyenv_root, _INTERPRETER_SET_FINGERPRINT)):
-        bootstrap_python_installer(pyenv_root)
+    with atomic_directory(target_dir=os.path.join(pyenv_root), exclusive=True) as target_dir:
+        if not target_dir.is_finalized():
+            bootstrap_python_installer(target_dir.work_dir)
 
-    if not os.path.exists(interpreter_location):
-        env = pyenv_env.copy()
-        if sys.platform.lower() == "linux":
-            env["CONFIGURE_OPTS"] = "--enable-shared"
-        subprocess.check_call([pyenv, "install", "--keep", version], env=env)
-        subprocess.check_call([pip, "install", "-U", "pip"])
+    with atomic_directory(
+        target_dir=interpreter_location, exclusive=True
+    ) as interpreter_target_dir:
+        if not interpreter_target_dir.is_finalized():
+            subprocess.check_call(
+                [
+                    "git",
+                    "--git-dir={}".format(os.path.join(pyenv_root, ".git")),
+                    "--work-tree={}".format(pyenv_root),
+                    "pull",
+                    "--ff-only",
+                    "https://github.com/pyenv/pyenv.git",
+                ]
+            )
+            env = pyenv_env.copy()
+            if sys.platform.lower().startswith("linux"):
+                env["CONFIGURE_OPTS"] = "--enable-shared"
+                # The pyenv builder detects `--enable-shared` and sets up `RPATH` via
+                # `LDFLAGS=-Wl,-rpath=... $LDFLAGS` to ensure the built python binary links the
+                # correct libpython shared lib. Some versions of compiler set the `RUNPATH` instead
+                # though which is searched _after_ the `LD_LIBRARY_PATH` environment variable. To
+                # ensure an inopportune `LD_LIBRARY_PATH` doesn't fool the pyenv python binary into
+                # linking the wrong libpython, force `RPATH`, which is searched 1st by the linker,
+                # with with `--disable-new-dtags`.
+                env["LDFLAGS"] = "-Wl,--disable-new-dtags"
+            subprocess.check_call([pyenv, "install", "--keep", version], env=env)
+            subprocess.check_call([pip, "install", "-U", "pip"])
 
-    python = os.path.join(interpreter_location, "bin", "python" + version[0:3])
+    major, minor = version.split(".")[:2]
+    python = os.path.join(
+        interpreter_location, "bin", "python{major}.{minor}".format(major=major, minor=minor)
+    )
 
     def run_pyenv(args):
         # type: (Iterable[str]) -> Text
@@ -507,18 +548,119 @@ def ensure_python_interpreter(version):
 
 @contextmanager
 def environment_as(**kwargs):
-    # type: (**str) -> Iterator[None]
+    # type: (**Any) -> Iterator[None]
     existing = {key: os.environ.get(key) for key in kwargs}
 
     def adjust_environment(mapping):
         for key, value in mapping.items():
             if value is not None:
-                os.environ[key] = value
+                os.environ[key] = str(value)
             else:
-                del os.environ[key]
+                os.environ.pop(key, None)
 
     adjust_environment(kwargs)
     try:
         yield
     finally:
         adjust_environment(existing)
+
+
+@contextmanager
+def pushd(directory):
+    # type: (str) -> Iterator[None]
+    cwd = os.getcwd()
+    try:
+        os.chdir(directory)
+        yield
+    finally:
+        os.chdir(cwd)
+
+
+def make_env(**kwargs):
+    # type: (**Any) -> Dict[str, str]
+    """Create a copy of the current environment with the given modifications.
+
+    The given kwargs add to or update the environment when they have a non-`None` value. When they
+    have a `None` value, the environment variable is removed from the environment.
+
+    All non-`None` values are converted to strings by apply `str`.
+    """
+    env = os.environ.copy()
+    env.update((k, str(v)) for k, v in kwargs.items() if v is not None)
+    for k, v in kwargs.items():
+        if v is None:
+            env.pop(k, None)
+    return env
+
+
+def run_commands_with_jitter(
+    commands,  # type: Iterable[Iterable[str]]
+    path_argument,  # type: str
+    extra_env=None,  # type: Optional[Mapping[str, str]]
+    delay=2.0,  # type: float
+):
+    # type: (...) -> List[str]
+    """Runs the commands with tactics that attempt to introduce randomness in outputs.
+
+    Each command will run against a clean Pex cache with a unique path injected as the value for
+    `path_argument`. A unique `PYTHONHASHSEED` is set in the environment for each execution as well.
+
+    Additionally, a delay is inserted between executions. By default, this delay is 2s to ensure zip
+    precision is stressed. See: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT.
+    """
+    td = safe_mkdtemp()
+    pex_root = os.path.join(td, "pex_root")
+
+    paths = []
+    for index, command in enumerate(commands):
+        path = os.path.join(td, str(index))
+        cmd = list(command) + [path_argument, path]
+
+        # Note that we change the `PYTHONHASHSEED` to ensure that there are no issues resulting
+        # from the random seed, such as data structures, as Tox sets this value by default.
+        # See:
+        # https://tox.readthedocs.io/en/latest/example/basic.html#special-handling-of-pythonhashseed
+        env = make_env(PEX_ROOT=pex_root, PYTHONHASHSEED=(index * 497) + 4)
+        if extra_env:
+            env.update(extra_env)
+
+        if index > 0:
+            safe_sleep(delay)
+
+        # Ensure the PEX is fully rebuilt.
+        safe_rmtree(pex_root)
+        subprocess.check_call(args=cmd, env=env)
+        paths.append(path)
+    return paths
+
+
+def run_command_with_jitter(
+    args,  # type: Iterable[str]
+    path_argument,  # type: str
+    extra_env=None,  # type: Optional[Mapping[str, str]]
+    delay=2.0,  # type: float
+    count=3,  # type: int
+):
+    # type: (...) -> List[str]
+    """Runs the command `count` times in an attempt to introduce randomness.
+
+    Each run of the command will run against a clean Pex cache with a unique path injected as the
+    value for `path_argument`. A unique `PYTHONHASHSEED` is set in the environment for each
+    execution as well.
+
+    Additionally, a delay is inserted between executions. By default, this delay is 2s to ensure zip
+    precision is stressed. See: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT.
+    """
+    return run_commands_with_jitter(
+        commands=list(itertools.repeat(list(args), count)),
+        path_argument=path_argument,
+        extra_env=extra_env,
+        delay=delay,
+    )
+
+
+def pex_project_dir():
+    # type: () -> str
+    return str(
+        subprocess.check_output(["git", "rev-parse", "--show-toplevel"]).decode("ascii").strip()
+    )

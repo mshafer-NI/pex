@@ -5,8 +5,9 @@ from __future__ import absolute_import
 
 import json
 import os
+import zipfile
 
-from pex import pex_warnings, variables
+from pex import layout, pex_warnings, variables
 from pex.common import can_write_dir, open_zip, safe_mkdtemp
 from pex.compatibility import PY2
 from pex.compatibility import string as compatibility_string
@@ -14,13 +15,13 @@ from pex.inherit_path import InheritPath
 from pex.orderedset import OrderedSet
 from pex.typing import TYPE_CHECKING, cast
 from pex.variables import ENV, Variables
-from pex.venv_bin_path import BinPath
+from pex.venv.bin_path import BinPath
 from pex.version import __version__ as pex_version
 
 if TYPE_CHECKING:
-    from pex.interpreter import PythonInterpreter
-
     from typing import Any, Dict, Mapping, Optional, Text, Union
+
+    from pex.interpreter import PythonInterpreter
 
 
 # TODO(wickman) Split this into a PexInfoBuilder/PexInfo to ensure immutability.
@@ -41,42 +42,23 @@ class PexInfo(object):
     entry_point: string                 # entry point into this pex
     script: string                      # script to execute in this pex environment
                                         # at most one of script/entry_point can be specified
-    zip_safe: bool, default True        # is this pex zip safe?
-    unzip: bool, default False          # should this pex be unzipped and re-executed from there?
     inherit_path: false/fallback/prefer # should this pex inherit site-packages + user site-packages
                                         # + PYTHONPATH?
     ignore_errors: True, default False  # should we ignore inability to resolve dependencies?
-    always_write_cache: False           # should we always write the internal cache to disk first?
-                                        # this is useful if you have very large dependencies that
-                                        # do not fit in RAM constrained environments
 
     .. versionchanged:: 0.8
       Removed the ``repositories`` and ``indices`` information, as they were never
       implemented.
     """
 
-    PATH = "PEX-INFO"
+    PATH = layout.PEX_INFO_PATH
+    BOOTSTRAP_CACHE = "bootstraps"
     INSTALL_CACHE = "installed_wheels"
 
     @classmethod
-    def make_build_properties(cls, interpreter=None):
-        # This lazy import is currently needed for performance reasons. At PEX runtime PexInfo is
-        # read in the bootstrap to see if the PEX should run in `--unzip` mode. If so, it must
-        # re-exec itself to run against its unzipped contents. Since `make_build_properties` is only
-        # used at PEX buildtime and the transitive imports of PythonInterpreter are large and slow,
-        # we avoid this import cost for runtime-only use.
-        #
-        # See: https://github.com/pantsbuild/pex/issues/1054
-        from pex.interpreter import PythonInterpreter
-
-        pi = interpreter or PythonInterpreter.get()
-        plat = pi.platform
-        platform_name = plat.platform
+    def make_build_properties(cls):
         return {
             "pex_version": pex_version,
-            "class": pi.identity.interpreter,
-            "version": pi.identity.version,
-            "platform": platform_name,
         }
 
     @classmethod
@@ -85,18 +67,21 @@ class PexInfo(object):
         pex_info = {
             "requirements": [],
             "distributions": {},
-            "build_properties": cls.make_build_properties(interpreter),
+            "build_properties": cls.make_build_properties(),
         }
         return cls(info=pex_info)
 
     @classmethod
     def from_pex(cls, pex):
         # type: (str) -> PexInfo
-        if os.path.isfile(pex):
+        if zipfile.is_zipfile(pex):  # Zip App PEX
             with open_zip(pex) as zf:
                 pex_info = zf.read(cls.PATH)
-        else:
-            with open(os.path.join(pex, cls.PATH)) as fp:
+        elif os.path.isfile(pex):  # Venv PEX
+            with open(os.path.join(os.path.dirname(pex), cls.PATH), "rb") as fp:
+                pex_info = fp.read()
+        else:  # Directory (Either loose or installed) PEX
+            with open(os.path.join(pex, cls.PATH), "rb") as fp:
                 pex_info = fp.read()
         return cls.from_json(pex_info)
 
@@ -110,9 +95,6 @@ class PexInfo(object):
     @classmethod
     def from_env(cls, env=ENV):
         # type: (Variables) -> PexInfo
-        pex_force_local = Variables.PEX_FORCE_LOCAL.strip_default(env)
-        zip_safe = None if pex_force_local is None else not pex_force_local
-
         pex_inherit_path = Variables.PEX_INHERIT_PATH.strip_default(env)
         inherit_path = None if pex_inherit_path is None else pex_inherit_path.value
 
@@ -120,12 +102,9 @@ class PexInfo(object):
             "pex_root": Variables.PEX_ROOT.strip_default(env),
             "entry_point": env.PEX_MODULE,
             "script": env.PEX_SCRIPT,
-            "zip_safe": zip_safe,
-            "unzip": Variables.PEX_UNZIP.strip_default(env),
             "venv": Variables.PEX_VENV.strip_default(env),
             "inherit_path": inherit_path,
             "ignore_errors": Variables.PEX_IGNORE_ERRORS.strip_default(env),
-            "always_write_cache": Variables.PEX_ALWAYS_CACHE.strip_default(env),
         }
         # Filter out empty entries not explicitly set in the environment.
         return cls(info=dict((k, v) for (k, v) in pex_info.items() if v is not None))
@@ -155,8 +134,8 @@ class PexInfo(object):
             raise ValueError(
                 "PexInfo can only be seeded with a dict, got: " "%s of type %s" % (info, type(info))
             )
-        self._pex_info = dict(info) if info else {}  # type Dict[str, Any]
-        self._distributions = self._pex_info.get("distributions", {})
+        self._pex_info = dict(info) if info else {}  # type: Dict[str, Any]
+        self._distributions = self._pex_info.get("distributions", {})  # type: Dict[str, str]
         # cast as set because pex info from json must store interpreter_constraints as a list
         self._interpreter_constraints = set(self._pex_info.get("interpreter_constraints", set()))
         requirements = self._pex_info.get("requirements", [])
@@ -186,45 +165,6 @@ class PexInfo(object):
         self._pex_info["build_properties"].update(value)
 
     @property
-    def zip_safe(self):
-        """Whether or not this PEX should be treated as zip-safe.
-
-        If set to false and the PEX is zipped, the contents of the PEX will be unpacked into a
-        directory within the PEX_ROOT prior to execution.  This allows code and frameworks depending
-        upon __file__ existing on disk to operate normally.
-
-        By default zip_safe is True.  May be overridden at runtime by the $PEX_FORCE_LOCAL environment
-        variable.
-        """
-        return self._pex_info.get("zip_safe", True)
-
-    @zip_safe.setter
-    def zip_safe(self, value):
-        self._pex_info["zip_safe"] = bool(value)
-
-    @property
-    def unzip(self):
-        """Whether or not PEX should be unzipped before it's executed.
-
-        Unzipping a PEX is a operation that can be cached on the 1st run of a given PEX file which
-        can result in lower startup latency in subsequent runs.
-        """
-        return self._pex_info.get("unzip", False)
-
-    @unzip.setter
-    def unzip(self, value):
-        self._pex_info["unzip"] = bool(value)
-
-    @property
-    def unzip_dir(self):
-        # type: () -> Optional[str]
-        if not self.unzip:
-            return None
-        if self.pex_hash is None:
-            raise ValueError("The unzip_dir was requested but no pex_hash was set.")
-        return variables.unzip_dir(self.pex_root, self.pex_hash)
-
-    @property
     def venv(self):
         # type: () -> bool
         """Whether or not PEX should be converted to a venv before it's executed.
@@ -251,13 +191,53 @@ class PexInfo(object):
         self._pex_info["venv_bin_path"] = str(value)
 
     @property
-    def venv_dir(self):
-        # type: () -> Optional[str]
+    def venv_copies(self):
+        # type: () -> bool
+        return self._pex_info.get("venv_copies", False)
+
+    @venv_copies.setter
+    def venv_copies(self, value):
+        # type: (bool) -> None
+        self._pex_info["venv_copies"] = value
+
+    @property
+    def venv_site_packages_copies(self):
+        # type: () -> bool
+        return self._pex_info.get("venv_site_packages_copies", False)
+
+    @venv_site_packages_copies.setter
+    def venv_site_packages_copies(self, value):
+        # type: (bool) -> None
+        self._pex_info["venv_site_packages_copies"] = value
+
+    def venv_dir(
+        self,
+        pex_file,  # type: str
+        interpreter=None,  # type: Optional[PythonInterpreter]
+    ):
+        # type: (...) -> Optional[str]
         if not self.venv:
             return None
         if self.pex_hash is None:
             raise ValueError("The venv_dir was requested but no pex_hash was set.")
-        return variables.venv_dir(self.pex_root, self.pex_hash, self.interpreter_constraints)
+        return variables.venv_dir(
+            pex_file=pex_file,
+            pex_root=self.pex_root,
+            pex_hash=self.pex_hash,
+            has_interpreter_constraints=bool(self.interpreter_constraints),
+            interpreter=interpreter,
+            pex_path=self.pex_path,
+        )
+
+    @property
+    def includes_tools(self):
+        # type: () -> bool
+        return self._pex_info.get("includes_tools", self.venv)
+
+    @includes_tools.setter
+    def includes_tools(self, value):
+        # type: (bool) -> None
+        self._pex_info["includes_tools"] = bool(value)
 
     @property
     def strip_pex_env(self):
@@ -384,15 +364,8 @@ class PexInfo(object):
 
     @property
     def distributions(self):
+        # type: () -> Dict[str, str]
         return self._distributions
-
-    @property
-    def always_write_cache(self):
-        return self._pex_info.get("always_write_cache", False)
-
-    @always_write_cache.setter
-    def always_write_cache(self, value):
-        self._pex_info["always_write_cache"] = bool(value)
 
     @property
     def raw_pex_root(self):
@@ -422,8 +395,31 @@ class PexInfo(object):
             self._pex_info["pex_root"] = value
 
     @property
+    def bootstrap_hash(self):
+        # type: () -> Optional[str]
+        return self._pex_info.get("bootstrap_hash")
+
+    @bootstrap_hash.setter
+    def bootstrap_hash(self, value):
+        # type: (str) -> None
+        self._pex_info["bootstrap_hash"] = value
+
+    @property
+    def bootstrap(self):
+        # type: () -> str
+        return layout.BOOTSTRAP_DIR
+
+    @property
+    def bootstrap_cache(self):
+        # type: () -> Optional[str]
+        if self.bootstrap_hash is None:
+            return None
+        return os.path.join(self.pex_root, self.BOOTSTRAP_CACHE, self.bootstrap_hash)
+
+    @property
     def internal_cache(self):
-        return ".deps"
+        # type: () -> str
+        return layout.DEPS_DIR
 
     @property
     def install_cache(self):
@@ -432,7 +428,7 @@ class PexInfo(object):
     @property
     def zip_unsafe_cache(self):
         #: type: () -> str
-        return os.path.join(self.pex_root, "code")
+        return os.path.join(self.pex_root, "user_code")
 
     def update(self, other):
         # type: (PexInfo) -> None

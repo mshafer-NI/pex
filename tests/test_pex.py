@@ -7,23 +7,23 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-from collections import namedtuple
 from contextlib import contextmanager
 from textwrap import dedent
 from types import ModuleType
 
 import pytest
 
+from pex import resolver
 from pex.common import safe_mkdir, safe_open, temporary_dir
-from pex.compatibility import PY2, WINDOWS, nested, to_bytes
+from pex.compatibility import PY2, WINDOWS, to_bytes
 from pex.interpreter import PythonInterpreter
 from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
 from pex.pex_info import PexInfo
-from pex.resolver import resolve
 from pex.testing import (
+    IS_PYPY3,
     PY27,
-    PY36,
+    PY310,
     WheelBuilder,
     built_wheel,
     ensure_python_interpreter,
@@ -34,16 +34,21 @@ from pex.testing import (
     temporary_content,
     write_simple_pex,
 )
+from pex.third_party.pkg_resources import Distribution
 from pex.typing import TYPE_CHECKING
 from pex.util import named_temporary_file
 
 try:
     from unittest import mock
 except ImportError:
-    import mock  # type: ignore[no-redef]
+    import mock  # type: ignore[no-redef,import]
 
 if TYPE_CHECKING:
-    from typing import Dict, Iterator, Union
+    from typing import Dict, Iterable, Iterator, Union
+
+    import attr  # vendor:skip
+else:
+    from pex.third_party import attr
 
 
 def test_pex_uncaught_exceptions():
@@ -108,6 +113,7 @@ def test_pex_sys_exit_prints_objects():
     _test_sys_exit('Exception("derp")', b"derp\n", 1)
 
 
+@pytest.mark.xfail(IS_PYPY3, reason="https://github.com/pantsbuild/pex/issues/1210")
 def test_pex_atexit_swallowing():
     # type: () -> None
     body = textwrap.dedent(
@@ -202,10 +208,9 @@ def test_minimum_sys_modules():
 
 def test_site_libs():
     # type: () -> None
-    with nested(mock.patch.object(PEX, "_get_site_packages"), temporary_dir()) as (
-        mock_site_packages,
-        tempdir,
-    ):
+    with mock.patch.object(
+        PEX, "_get_site_packages"
+    ) as mock_site_packages, temporary_dir() as tempdir:
         site_packages = os.path.join(tempdir, "site-packages")
         os.mkdir(site_packages)
         mock_site_packages.return_value = set([site_packages])
@@ -216,10 +221,9 @@ def test_site_libs():
 @pytest.mark.skipif(WINDOWS, reason="No symlinks on windows")
 def test_site_libs_symlink():
     # type: () -> None
-    with nested(mock.patch.object(PEX, "_get_site_packages"), temporary_dir()) as (
-        mock_site_packages,
-        tempdir,
-    ):
+    with mock.patch.object(
+        PEX, "_get_site_packages"
+    ) as mock_site_packages, temporary_dir() as tempdir:
         site_packages = os.path.join(tempdir, "site-packages")
         os.mkdir(site_packages)
         site_packages_link = os.path.join(tempdir, "site-packages-link")
@@ -238,10 +242,9 @@ def test_site_libs_excludes_prefix():
     Make sure to exclude it.
     """
 
-    with nested(mock.patch.object(PEX, "_get_site_packages"), temporary_dir()) as (
-        mock_site_packages,
-        tempdir,
-    ):
+    with mock.patch.object(
+        PEX, "_get_site_packages"
+    ) as mock_site_packages, temporary_dir() as tempdir:
         site_packages = os.path.join(tempdir, "site-packages")
         os.mkdir(site_packages)
         mock_site_packages.return_value = set([site_packages, sys.prefix])
@@ -267,8 +270,8 @@ def test_pex_script(project_name, zip_safe):
 
         env_copy["PEX_SCRIPT"] = "shell_script"
         so, rc = run_simple_pex_test("", env=env_copy, dists=[bdist_path])
-        assert rc == 1, so.decode("utf-8")
-        assert b"Unable to parse" in so
+        assert rc == 0, so.decode("utf-8")
+        assert b"hello world from shell script" in so
 
 
 def test_pex_run():
@@ -307,13 +310,16 @@ def test_pex_run_extra_sys_path():
             assert b"extra/syspath/entry2" in syspath
 
 
-class PythonpathIsolationTest(
-    namedtuple("PythonpathIsolationTest", ["pythonpath", "dists", "exe"])
-):
+@attr.s(frozen=True)
+class PythonpathIsolationTest(object):
     @staticmethod
     def pex_info(inherit_path):
         # type: (Union[str, bool]) -> PexInfo
         return PexInfo.from_json(json.dumps({"inherit_path": inherit_path}))
+
+    pythonpath = attr.ib()  # type: str
+    dists = attr.ib()  # type: Iterable[Distribution]
+    exe = attr.ib()  # type: str
 
     def assert_isolation(self, inherit_path, expected_output):
         # type: (Union[str, bool], str) -> None
@@ -561,7 +567,7 @@ def test_pex_verify_entry_point_module_should_fail():
 def test_activate_interpreter_different_from_current():
     # type: () -> None
     with temporary_dir() as pex_root:
-        interp_version = PY36 if PY2 else PY27
+        interp_version = PY310 if PY2 else PY27
         custom_interpreter = PythonInterpreter.from_binary(
             ensure_python_interpreter(interp_version)
         )
@@ -606,8 +612,17 @@ def test_execute_interpreter_dashm_module():
     with temporary_dir() as pex_chroot:
         pex_builder = PEXBuilder(path=pex_chroot)
         pex_builder.add_source(None, "foo/__init__.py")
-        with tempfile.NamedTemporaryFile() as fp:
-            fp.write(b'import sys; print(" ".join(sys.argv))')
+        with tempfile.NamedTemporaryFile(mode="w") as fp:
+            fp.write(
+                dedent(
+                    """\
+                    import os
+                    import sys
+
+                    print("{} {}".format(os.path.realpath(sys.argv[0]), " ".join(sys.argv[1:])))
+                    """
+                )
+            )
             fp.flush()
             pex_builder.add_source(fp.name, "foo/bar.py")
         pex_builder.freeze()
@@ -621,7 +636,9 @@ def test_execute_interpreter_dashm_module():
         stdout, stderr = process.communicate()
 
         assert 0 == process.returncode
-        assert b"foo.bar one two\n" == stdout
+        assert "{} one two\n".format(
+            os.path.realpath(os.path.join(pex_chroot, "foo/bar.py"))
+        ) == stdout.decode("utf-8")
         assert b"" == stderr
 
 
@@ -698,12 +715,12 @@ def test_pex_run_strip_env():
 
 def test_pex_run_custom_setuptools_useable():
     # type: () -> None
-    resolved_dists = resolve(["setuptools==36.2.7"])
-    dists = [resolved_dist.distribution for resolved_dist in resolved_dists]
+    result = resolver.resolve(requirements=["setuptools==43.0.0"])
+    dists = [installed_dist.distribution for installed_dist in result.installed_distributions]
     with temporary_dir() as temp_dir:
         pex = write_simple_pex(
             temp_dir,
-            "from setuptools.sandbox import run_setup",
+            "import setuptools, sys; sys.exit(0 if '43.0.0' == setuptools.__version__ else 1)",
             dists=dists,
         )
         rc = PEX(pex.path()).run()
@@ -713,35 +730,19 @@ def test_pex_run_custom_setuptools_useable():
 def test_pex_run_conflicting_custom_setuptools_useable():
     # type: () -> None
     # Here we use our vendored, newer setuptools to build the pex which has an older setuptools
-    # requirement. These setuptools dists have different pkg_resources APIs:
-    # $ diff \
-    #   <(zipinfo -1 setuptools-20.3.1-py2.py3-none-any.whl | grep pkg_resources/ | sort) \
-    #   <(zipinfo -1 setuptools-40.6.2-py2.py3-none-any.whl | grep pkg_resources/ | sort)
-    # 2a3,4
-    # > pkg_resources/py31compat.py
-    # > pkg_resources/_vendor/appdirs.py
+    # requirement.
 
-    resolved_dists = resolve(["setuptools==20.3.1"])
-    dists = [resolved_dist.distribution for resolved_dist in resolved_dists]
+    result = resolver.resolve(requirements=["setuptools==43.0.0"])
+    dists = [installed_dist.distribution for installed_dist in result.installed_distributions]
     with temporary_dir() as temp_dir:
         pex = write_simple_pex(
             temp_dir,
             exe_contents=textwrap.dedent(
                 """
                 import sys
-                import pkg_resources
+                import setuptools
 
-                try:
-                    from pkg_resources import appdirs
-                    sys.exit(1)
-                except ImportError:
-                    pass
-
-                try:
-                    from pkg_resources import py31compat
-                    sys.exit(2)
-                except ImportError:
-                    pass
+                sys.exit(0 if '43.0.0' == setuptools.__version__ else 1)
                 """
             ),
             dists=dists,
@@ -753,8 +754,10 @@ def test_pex_run_conflicting_custom_setuptools_useable():
 def test_pex_run_custom_pex_useable():
     # type: () -> None
     old_pex_version = "0.7.0"
-    resolved_dists = resolve(["pex=={}".format(old_pex_version), "setuptools==40.6.3"])
-    dists = [resolved_dist.distribution for resolved_dist in resolved_dists]
+    result = resolver.resolve(
+        requirements=["pex=={}".format(old_pex_version), "setuptools==40.6.3"]
+    )
+    dists = [installed_dist.distribution for installed_dist in result.installed_distributions]
     with temporary_dir() as temp_dir:
         from pex.version import __version__
 
@@ -784,6 +787,7 @@ def test_pex_run_custom_pex_useable():
         assert old_pex_version != __version__
 
 
+@pytest.mark.skipif(PY2, reason="ResourceWarning was only introduced in Python 3.2.")
 def test_interpreter_teardown_dev_null_unclosed_resource_warning_suppressed():
     # type: () -> None
 
@@ -794,6 +798,7 @@ def test_interpreter_teardown_dev_null_unclosed_resource_warning_suppressed():
         pex_builder.freeze()
 
         output = subprocess.check_output(
-            args=[sys.executable, "-W" "all", pex_chroot, "-c", ""], stderr=subprocess.STDOUT
+            args=[sys.executable, "-W", "error::ResourceWarning", pex_chroot, "-c", ""],
+            stderr=subprocess.STDOUT,
         )
         assert b"" == output

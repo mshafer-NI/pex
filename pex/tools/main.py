@@ -3,33 +3,23 @@
 
 from __future__ import absolute_import, print_function
 
-import functools
-import logging
 import os
-import sys
 from argparse import ArgumentParser, Namespace
 
 from pex import pex_bootstrapper
+from pex.commands.command import GlobalConfigurationError, Main
 from pex.pex import PEX
 from pex.pex_info import PexInfo
+from pex.result import Result, catch
 from pex.tools import commands
-from pex.tools.command import Result
+from pex.tools.command import PEXCommand
 from pex.tracer import TRACER
-from pex.typing import TYPE_CHECKING, cast
+from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Callable, NoReturn, Optional
+    from typing import Callable, Optional, Union
 
     CommandFunc = Callable[[PEX, Namespace], Result]
-
-
-def show_help(
-    parser,  # type: ArgumentParser
-    *_args,  # type: Any
-    **_kwargs  # type: Any
-):
-    # type: (...) -> NoReturn
-    parser.error("a subcommand is required")
 
 
 def simplify_pex_path(pex_path):
@@ -47,54 +37,59 @@ def simplify_pex_path(pex_path):
     return pex_path
 
 
-def main(
-    pex=None,  # type: Optional[PEX]
-    pex_prog_path=None,  # type: Optional[str]
-):
-    # type: (...) -> int
-    logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
-    with TRACER.timed("Executing PEX_TOOLS"):
-        pex_prog_path = simplify_pex_path(pex_prog_path or pex.path()) if pex else None
-        prog = (
-            "PEX_TOOLS=1 {pex_path}".format(pex_path=pex_prog_path)
-            if pex
-            else "{python} {module}".format(
-                python=sys.executable, module=".".join(__name__.split(".")[:-1])
+class PexTools(Main[PEXCommand]):
+    def __init__(self, pex=None):
+        # type: (Optional[PEX]) -> None
+
+        pex_prog_path = simplify_pex_path(pex.path()) if pex else None
+
+        # By default, let argparse derive prog from sys.argv[0].
+        prog = None  # type: Optional[str]
+        if pex:
+            prog = "PEX_TOOLS=1 {pex_path}".format(pex_path=pex_prog_path)
+
+        description = "Tools for working with {}.".format(pex_prog_path if pex else "PEX files")
+        subparsers_description = (
+            "{} can be operated on using any of the following subcommands.".format(
+                "The PEX file {}".format(pex_prog_path) if pex else "A PEX file"
             )
         )
-        parser = ArgumentParser(
+
+        super(PexTools, self).__init__(
+            description=description,
+            subparsers_description=subparsers_description,
+            command_types=commands.all_commands(),
             prog=prog,
-            description="Tools for working with {}.".format(pex_prog_path if pex else "PEX files"),
         )
-        if pex is None:
+        self._pex = pex
+
+    def add_arguments(self, parser):
+        # type: (ArgumentParser) -> None
+        if self._pex is None:
             parser.add_argument(
                 "pex", nargs=1, metavar="PATH", help="The path of the PEX file to operate on."
             )
-        parser.set_defaults(func=functools.partial(show_help, parser))
-        subparsers = parser.add_subparsers(
-            description="{} can be operated on using any of the following subcommands.".format(
-                "The PEX file {}".format(pex_prog_path) if pex else "A PEX file"
-            ),
-        )
-        for command in commands.all_commands():
-            name = command.__class__.__name__.lower()
-            # N.B.: We want to trigger the default argparse description if the doc string is empty.
-            description = command.__doc__ or None
-            help_text = description.splitlines()[0] if description else None
-            command_parser = subparsers.add_parser(name, help=help_text, description=description)
-            command.add_arguments(command_parser)
-            command_parser.set_defaults(func=command.run)
 
-        options = parser.parse_args()
-        if pex is None:
-            pex_info = PexInfo.from_pex(options.pex[0])
-            pex_info.update(PexInfo.from_env())
-            interpreter = pex_bootstrapper.find_compatible_interpreter(
-                interpreter_constraints=pex_info.interpreter_constraints
-            )
-            pex = PEX(options.pex[0], interpreter=interpreter)
 
-        func = cast("CommandFunc", options.func)
-        result = func(pex, options)
-        result.maybe_display()
-        return result.exit_code
+def main(pex=None):
+    # type: (Optional[PEX]) -> Union[int, str]
+
+    pex_tools = PexTools(pex=pex)
+    try:
+        with pex_tools.parsed_command() as pex_command, TRACER.timed(
+            "Executing PEX_TOOLS {}".format(pex_command.name())
+        ):
+            if pex is None:
+                pex_file_path = pex_command.options.pex[0]
+                pex_info = PexInfo.from_pex(pex_file_path)
+                pex_info.update(PexInfo.from_env())
+                interpreter = pex_bootstrapper.find_compatible_interpreter(
+                    interpreter_constraints=pex_info.interpreter_constraints
+                )
+                pex = PEX(pex_file_path, interpreter=interpreter)
+
+            result = catch(pex_command.run, pex)
+            result.maybe_display()
+            return result.exit_code
+    except GlobalConfigurationError as e:
+        return str(e)

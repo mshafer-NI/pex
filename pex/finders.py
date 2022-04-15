@@ -3,19 +3,53 @@
 
 from __future__ import absolute_import
 
+import ast
 import os
-from collections import namedtuple
+
+from pex.common import is_python_script
+from pex.pep_376 import InstalledWheel
+from pex.third_party.pkg_resources import Distribution
+from pex.typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from typing import Optional
+
+    import attr  # vendor:skip
+else:
+    from pex.third_party import attr
 
 
-class DistributionScript(namedtuple("DistributionScript", ["dist", "path"])):
+@attr.s(frozen=True)
+class DistributionScript(object):
     @classmethod
-    def find(cls, dist, name):
-        script_path = os.path.join(dist.location, "bin", name)
+    def find(
+        cls,
+        dist,  # type: Distribution
+        name,  # type: str
+    ):
+        # type: (...) -> Optional[DistributionScript]
+        script_path = InstalledWheel.load(dist.location).stashed_path("bin", name)
         return cls(dist=dist, path=script_path) if os.path.isfile(script_path) else None
 
+    dist = attr.ib()  # type: Distribution
+    path = attr.ib()  # type: str
+
     def read_contents(self):
-        with open(self.path) as fp:
+        # type: () -> bytes
+        with open(self.path, "rb") as fp:
             return fp.read()
+
+    def python_script(self):
+        # type: () -> Optional[ast.AST]
+        if not is_python_script(self.path):
+            return None
+
+        try:
+            return cast(
+                ast.AST, compile(self.read_contents(), self.path, "exec", flags=0, dont_inherit=1)
+            )
+        except (SyntaxError, TypeError):
+            return None
 
 
 def get_script_from_distributions(name, dists):

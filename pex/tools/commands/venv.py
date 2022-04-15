@@ -4,271 +4,78 @@
 from __future__ import absolute_import
 
 import errno
+import logging
 import os
-import shutil
-import zipfile
-from argparse import ArgumentParser, Namespace
-from collections import defaultdict
-from textwrap import dedent
+from argparse import ArgumentParser
 
-from pex import pex_builder, pex_warnings
-from pex.common import chmod_plus_x, pluralize, safe_mkdir
-from pex.environment import PEXEnvironment
+from pex.common import safe_delete, safe_rmtree
+from pex.enum import Enum
 from pex.pex import PEX
-from pex.tools.command import Command, Error, Ok, Result
-from pex.tools.commands.virtualenv import PipUnavailableError, Virtualenv
-from pex.tracer import TRACER
+from pex.result import Error, Ok, Result
+from pex.tools.command import PEXCommand
 from pex.typing import TYPE_CHECKING
-from pex.venv_bin_path import BinPath
+from pex.venv.bin_path import BinPath
+from pex.venv.install_scope import InstallScope
+from pex.venv.pex import populate_venv
+from pex.venv.virtualenv import PipUnavailableError, Virtualenv
 
 if TYPE_CHECKING:
-    from typing import Iterable, Iterator, Optional, Tuple
+    from typing import Optional
+
+    import attr  # vendor:skip
+else:
+    from pex.third_party import attr
 
 
-# N.B.: We can't use shutil.copytree since we copy from multiple source locations to the same site
-# packages directory destination. Since we're forced to stray from the stdlib here, support for
-# hardlinks is added to provide a measurable speed up and disk space savings when possible.
-def _copytree(
-    src,  # type: str
-    dst,  # type: str
-    exclude=(),  # type: Tuple[str, ...]
-):
-    # type: (...) -> Iterator[Tuple[str, str]]
-    safe_mkdir(dst)
-    link = True
-    for root, dirs, files in os.walk(src, topdown=True, followlinks=False):
-        if src == root:
-            dirs[:] = [d for d in dirs if d not in exclude]
-            files[:] = [f for f in files if f not in exclude]
-
-        for d in dirs:
-            try:
-                os.mkdir(os.path.join(dst, os.path.relpath(os.path.join(root, d), src)))
-            except OSError as e:
-                if e.errno != errno.EEXIST:
-                    raise e
-
-        for f in files:
-            src_entry = os.path.join(root, f)
-            dst_entry = os.path.join(dst, os.path.relpath(src_entry, src))
-            yield src_entry, dst_entry
-            try:
-                if link:
-                    try:
-                        os.link(src_entry, dst_entry)
-                        continue
-                    except OSError as e:
-                        if e.errno != errno.EXDEV:
-                            raise e
-                        link = False
-                shutil.copy(src_entry, dst_entry)
-            except OSError as e:
-                if e.errno != errno.EEXIST:
-                    raise e
+logger = logging.getLogger(__name__)
 
 
-class CollisionError(Exception):
-    """Indicates multiple distributions provided the same file when merging a PEX into a venv."""
+class RemoveScope(Enum["RemoveScope.Value"]):
+    class Value(Enum.Value):
+        pass
+
+    PEX = Value("pex")
+    PEX_AND_PEX_ROOT = Value("all")
 
 
-def populate_venv_with_pex(
-    venv,  # type: Virtualenv
-    pex,  # type: PEX
-    bin_path=BinPath.FALSE,  # type: BinPath.Value
-    python=None,  # type: Optional[str]
-    collisions_ok=True,  # type: bool
-):
-    # type: (...) -> None
+@attr.s(frozen=True)
+class InstallScopeState(object):
+    @classmethod
+    def load(cls, venv_dir):
+        # type: (str) -> InstallScopeState
 
-    venv_python = python or venv.interpreter.binary
-    venv_bin_dir = os.path.dirname(python) if python else venv.bin_dir
-    venv_dir = os.path.dirname(venv_bin_dir) if python else venv.venv_dir
+        state_file = os.path.join(venv_dir, ".pex-venv-scope")
+        prior_state = None  # type: Optional[InstallScope.Value]
+        try:
+            with open(state_file) as fp:
+                prior_state = InstallScope.for_value(fp.read().strip())
+        except IOError as e:
+            if e.errno != errno.ENOENT:
+                raise e
 
-    # 1. Populate the venv with the PEX contents.
-    provenance = defaultdict(list)
+        return cls(venv_dir=venv_dir, state_file=state_file, prior_state=prior_state)
 
-    def record_provenance(src_to_dst):
-        # type: (Iterable[Tuple[str, str]]) -> None
-        for src, dst in src_to_dst:
-            provenance[dst].append(src)
+    venv_dir = attr.ib()  # type: str
+    _state_file = attr.ib()  # type: str
+    _prior_state = attr.ib(default=None)  # type: Optional[InstallScope.Value]
 
-    pex_info = pex.pex_info()
-    if zipfile.is_zipfile(pex.path()):
-        record_provenance(
-            PEXEnvironment.explode_code(
-                pex.path(), pex_info, venv.site_packages_dir, exclude=("__main__.py",)
-            )
-        )
-    else:
-        record_provenance(
-            _copytree(
-                src=pex.path(),
-                dst=venv.site_packages_dir,
-                exclude=(pex_info.internal_cache, pex_builder.BOOTSTRAP_DIR, "__main__.py"),
-            )
-        )
+    @property
+    def is_partial_install(self):
+        return self._prior_state in (InstallScope.DEPS_ONLY, InstallScope.SOURCE_ONLY)
 
-    for dist in pex.activate():
-        record_provenance(
-            _copytree(src=dist.location, dst=venv.site_packages_dir, exclude=("bin",))
-        )
-        dist_bin_dir = os.path.join(dist.location, "bin")
-        if os.path.isdir(dist_bin_dir):
-            record_provenance(_copytree(dist_bin_dir, venv.bin_dir))
-
-    collisions = {dst: srcs for dst, srcs in provenance.items() if len(srcs) > 1}
-    if collisions:
-        message_lines = [
-            "Encountered {collision} building venv at {venv_dir} from {pex}:".format(
-                collision=pluralize(collisions, "collision"), venv_dir=venv_dir, pex=pex.path()
-            )
-        ]
-        for index, (dst, srcs) in enumerate(collisions.items(), start=1):
-            message_lines.append(
-                "{index}. {dst} was provided by:\n\t{srcs}".format(
-                    index=index, dst=dst, srcs="\n\t".join(srcs)
-                )
-            )
-        message = "\n".join(message_lines)
-        if not collisions_ok:
-            raise CollisionError(message)
-        pex_warnings.warn(message)
-
-    # 2. Add a __main__ to the root of the venv for running the venv dir like a loose PEX dir
-    # and a main.py for running as a script.
-    main_contents = dedent(
-        """\
-        #!{venv_python} -sE
-
-        import os
-        import sys
-
-        python = {venv_python!r}
-        if sys.executable != python:
-            sys.stderr.write("Re-execing from {{}}\\n".format(sys.executable))
-            os.execv(python, [python, "-sE"] + sys.argv)
-
-        os.environ["VIRTUAL_ENV"] = {venv_dir!r}
-        sys.path.extend(os.environ.get("PEX_EXTRA_SYS_PATH", "").split(os.pathsep))
-
-        bin_dir = {venv_bin_dir!r}
-        bin_path = os.environ.get("PEX_VENV_BIN_PATH", {bin_path!r})
-        if bin_path != "false":
-            PATH = os.environ.get("PATH", "").split(os.pathsep)
-            if bin_path == "prepend":
-                PATH.insert(0, bin_dir)
-            elif bin_path == "append":
-                PATH.append(bin_dir)
-            else:
-                sys.stderr.write(
-                    "PEX_VENV_BIN_PATH must be one of 'false', 'prepend' or 'append', given: "
-                    "{{!r}}\\n".format(
-                        bin_path
-                    )
-                )
-                sys.exit(1)
-            os.environ["PATH"] = os.pathsep.join(PATH)
-
-        PEX_EXEC_OVERRIDE_KEYS = ("PEX_INTERPRETER", "PEX_SCRIPT", "PEX_MODULE")
-        pex_overrides = {{
-            key: os.environ.pop(key) for key in PEX_EXEC_OVERRIDE_KEYS if key in os.environ
-        }}
-        if len(pex_overrides) > 1:
-            sys.stderr.write(
-                "Can only specify one of {{overrides}}; found: {{found}}\\n".format(
-                    overrides=", ".join(PEX_EXEC_OVERRIDE_KEYS),
-                    found=" ".join("{{}}={{}}".format(k, v) for k, v in pex_overrides.items())
-                )
-            )
-            sys.exit(1)
-
-        pex_script = pex_overrides.get("PEX_SCRIPT")
-        if pex_script:
-            script_path = os.path.join(bin_dir, pex_script)
-            os.execv(script_path, [script_path] + sys.argv[1:])
-
-        pex_interpreter = pex_overrides.get("PEX_INTERPRETER", "").lower() in ("1", "true")
-        PEX_INTERPRETER_ENTRYPOINT = "code:interact"
-        entry_point = (
-            PEX_INTERPRETER_ENTRYPOINT
-            if pex_interpreter
-            else pex_overrides.get("PEX_MODULE", {entry_point!r} or PEX_INTERPRETER_ENTRYPOINT)
-        )
-        if entry_point == PEX_INTERPRETER_ENTRYPOINT and len(sys.argv) > 1:
-            args = sys.argv[1:]
-            arg = args[0]
-            if arg == "-m":
-                if len(args) < 2:
-                    sys.stderr.write("Argument expected for the -m option\\n")
-                    sys.exit(2)
-                entry_point = module = args[1]
-                sys.argv = args[1:]
-                # Fall through to entry_point handling below.
-            else:
-                filename = arg
-                sys.argv = args
-                if arg == "-c":
-                    if len(args) < 2:
-                        sys.stderr.write("Argument expected for the -c option\\n")
-                        sys.exit(2)
-                    filename = "-c <cmd>"
-                    content = args[1]
-                    sys.argv = ["-c"] + args[2:]
-                elif arg == "-":
-                    content = sys.stdin.read()
-                else:
-                    with open(arg) as fp:
-                        content = fp.read()
-
-                ast = compile(content, filename, "exec", flags=0, dont_inherit=1)
-                globals_map = globals().copy()
-                globals_map["__name__"] = "__main__"
-                globals_map["__file__"] = filename
-                locals_map = globals_map
-                {exec_ast}
-                sys.exit(0)
-
-        module_name, _, function = entry_point.partition(":")
-        if not function:
-            import runpy
-            runpy.run_module(module_name, run_name="__main__")
-        else:
-            import importlib
-            module = importlib.import_module(module_name)
-            # N.B.: Functions may be hung off top-level objects in the module namespace,
-            # e.g.: Class.method; so we drill down through any attributes to the final function
-            # object.
-            namespace, func = module, None
-            for attr in function.split("."):
-                func = namespace = getattr(namespace, attr)
-            func()
-        """.format(
-            venv_python=venv_python,
-            venv_bin_dir=venv_bin_dir,
-            venv_dir=venv_dir,
-            bin_path=bin_path,
-            entry_point=pex_info.entry_point,
-            exec_ast=(
-                "exec ast in globals_map, locals_map"
-                if venv.interpreter.version[0] == 2
-                else "exec(ast, globals_map, locals_map)"
-            ),
-        )
-    )
-    with open(venv.join_path("__main__.py"), "w") as fp:
-        fp.write(main_contents)
-    chmod_plus_x(fp.name)
-    os.symlink(os.path.basename(fp.name), venv.join_path("pex"))
-
-    # 3. Re-write any (console) scripts to use the venv Python.
-    for script in venv.rewrite_scripts(python=python, python_args="-sE"):
-        TRACER.log("Re-writing {}".format(script))
+    def save(self, install_scope):
+        # type: (InstallScope.Value) -> None
+        if {InstallScope.DEPS_ONLY, InstallScope.SOURCE_ONLY} == {self._prior_state, install_scope}:
+            install_scope = InstallScope.ALL
+        with open(self._state_file, "w") as fp:
+            fp.write(str(install_scope))
 
 
-class Venv(Command):
+class Venv(PEXCommand):
     """Creates a venv from the PEX file."""
 
-    def add_arguments(self, parser):
+    @classmethod
+    def add_arguments(cls, parser):
         # type: (ArgumentParser) -> None
         parser.add_argument(
             "venv",
@@ -277,10 +84,30 @@ class Venv(Command):
             help="The directory to create the virtual environment in.",
         )
         parser.add_argument(
+            "--scope",
+            default=InstallScope.ALL.value,
+            choices=InstallScope.values(),
+            type=InstallScope.for_value,
+            help=(
+                "The scope of code contained in the Pex that is installed in the venv. By default"
+                "{all} code is installed and this is generally what you want. However, in some "
+                "situations it's beneficial to split the venv installation into {deps} and "
+                "{sources} steps. This is particularly useful when installing a PEX in a container "
+                "image. See "
+                "https://pex.readthedocs.io/en/latest/recipes.html#pex-app-in-a-container for more "
+                "information.".format(
+                    all=InstallScope.ALL,
+                    deps=InstallScope.DEPS_ONLY,
+                    sources=InstallScope.SOURCE_ONLY,
+                )
+            ),
+        )
+        parser.add_argument(
             "-b",
             "--bin-path",
-            choices=[choice.value for choice in BinPath.values],
             default=BinPath.FALSE.value,
+            choices=BinPath.values(),
+            type=BinPath.for_value,
             help="Add the venv bin dir to the PATH in the __main__.py script.",
         )
         parser.add_argument(
@@ -306,22 +133,71 @@ class Venv(Command):
             default=False,
             help="Add pip to the venv.",
         )
+        parser.add_argument(
+            "--copies",
+            action="store_true",
+            default=False,
+            help="Create the venv using copies of system files instead of symlinks",
+        )
+        parser.add_argument(
+            "--compile",
+            action="store_true",
+            default=False,
+            help="Compile all `.py` files in the venv.",
+        )
+        parser.add_argument(
+            "--prompt",
+            help="A custom prompt for the venv activation scripts to use.",
+        )
+        parser.add_argument(
+            "--rm",
+            "--remove",
+            dest="remove",
+            default=None,
+            choices=RemoveScope.values(),
+            type=RemoveScope.for_value,
+            help=(
+                "Remove the PEX after creating a venv from it if the {pex!r} value is specified; "
+                "otherwise, remove the PEX and the PEX_ROOT if the {all!r} value is "
+                "specified.".format(
+                    pex=RemoveScope.PEX.value, all=RemoveScope.PEX_AND_PEX_ROOT.value
+                )
+            ),
+        )
+        cls.register_global_arguments(parser, include_verbosity=False)
 
-    def run(
-        self,
-        pex,  # type: PEX
-        options,  # type: Namespace
-    ):
-        # type: (...) -> Result
+    def run(self, pex):
+        # type: (PEX) -> Result
 
-        venv = Virtualenv.create(options.venv[0], interpreter=pex.interpreter, force=options.force)
-        populate_venv_with_pex(
+        venv_dir = self.options.venv[0]
+        install_scope_state = InstallScopeState.load(venv_dir)
+        if install_scope_state.is_partial_install and not self.options.force:
+            venv = Virtualenv(venv_dir)
+        else:
+            venv = Virtualenv.create(
+                venv_dir,
+                interpreter=pex.interpreter,
+                force=self.options.force,
+                copies=self.options.copies,
+                prompt=self.options.prompt,
+            )
+
+        if self.options.prompt != venv.custom_prompt:
+            logger.warning(
+                "Unable to apply custom --prompt {prompt!r} in {python} venv; continuing with the "
+                "default prompt.".format(
+                    prompt=self.options.prompt, python=venv.interpreter.identity
+                )
+            )
+        populate_venv(
             venv,
             pex,
-            bin_path=BinPath.for_value(options.bin_path),
-            collisions_ok=options.collisions_ok,
+            bin_path=self.options.bin_path,
+            collisions_ok=self.options.collisions_ok,
+            symlink=False,
+            scope=self.options.scope,
         )
-        if options.pip:
+        if self.options.pip:
             try:
                 venv.install_pip()
             except PipUnavailableError as e:
@@ -329,5 +205,15 @@ class Venv(Command):
                     "The virtual environment was successfully created, but Pip was not "
                     "installed:\n{}".format(e)
                 )
+        if self.options.compile:
+            pex.interpreter.execute(["-m", "compileall", venv_dir])
+        if self.options.remove is not None:
+            if os.path.isdir(pex.path()):
+                safe_rmtree(pex.path())
+            else:
+                safe_delete(pex.path())
+            if self.options.remove is RemoveScope.PEX_AND_PEX_ROOT:
+                safe_rmtree(pex.pex_info().pex_root)
 
+        install_scope_state.save(self.options.scope)
         return Ok()

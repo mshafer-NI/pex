@@ -7,13 +7,16 @@
 from __future__ import absolute_import
 
 import os
+import re
+import sys
 from abc import ABCMeta
+from io import BytesIO
 from sys import version_info as sys_version_info
 
-from pex.typing import TYPE_CHECKING
+from pex.typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from typing import Optional, AnyStr, Text
+    from typing import AnyStr, Optional, Text, Tuple, Type
 
 
 try:
@@ -28,7 +31,7 @@ AbstractClass = ABCMeta("AbstractClass", (object,), {})
 PY2 = sys_version_info[0] == 2
 PY3 = sys_version_info[0] == 3
 
-string = (str,) if PY3 else (str, unicode)  # type: ignore[name-defined]
+string = cast("Tuple[Type, ...]", (str,) if PY3 else (str, unicode))  # type: ignore[name-defined]
 
 if PY2:
     from collections import Iterable as Iterable
@@ -56,7 +59,6 @@ if PY2:
             return unicode(st, encoding)
         else:
             raise ValueError("Cannot convert %s to a unicode string" % type(st))
-
 
 else:
 
@@ -93,43 +95,34 @@ if PY3:
         exec (ast, globals_map, locals_map)
         return locals_map
 
-
 else:
-    # This will result in `exec_function` being defined at runtime.
+
+    def exec_function(ast, globals_map):
+        raise AssertionError("Expected this function to be re-defined at runtime.")
+
+    # This will result in `exec_function` being re-defined at runtime.
     eval(compile(_PY3_EXEC_FUNCTION, "<exec_function>", "exec"))
 
-if PY3:
-    from contextlib import contextmanager, ExitStack
-
-    @contextmanager
-    def nested(*context_managers):
-        enters = []
-        with ExitStack() as stack:
-            for manager in context_managers:
-                enters.append(stack.enter_context(manager))
-            yield tuple(enters)
-
-
-else:
-    from contextlib import nested as nested
-
 
 if PY3:
-    import urllib.parse as urlparse
-
+    from urllib import parse as urlparse
     from urllib.error import HTTPError as HTTPError
-    from urllib.request import build_opener as build_opener
+    from urllib.parse import unquote as unquote
+    from urllib.request import FileHandler as FileHandler
     from urllib.request import HTTPSHandler as HTTPSHandler
     from urllib.request import ProxyHandler as ProxyHandler
     from urllib.request import Request as Request
+    from urllib.request import build_opener as build_opener
 else:
-    import urlparse as urlparse
+    from urllib import unquote as unquote
 
-    from urllib2 import build_opener as build_opener
+    import urlparse as urlparse
+    from urllib2 import FileHandler as FileHandler
     from urllib2 import HTTPError as HTTPError
     from urllib2 import HTTPSHandler as HTTPSHandler
     from urllib2 import ProxyHandler as ProxyHandler
     from urllib2 import Request as Request
+    from urllib2 import build_opener as build_opener
 
 if PY3:
     from queue import Queue as Queue
@@ -145,10 +138,31 @@ if PY3:
             cpu_set = os.sched_getaffinity(0)
             return len(cpu_set)
 
-
 else:
-    from Queue import Queue as Queue
     from multiprocessing import cpu_count as cpu_count
 
+    from Queue import Queue as Queue
 
 WINDOWS = os.name == "nt"
+
+
+# Universal newlines is the default in Python 3.
+MODE_READ_UNIVERSAL_NEWLINES = "rU" if PY2 else "r"
+
+
+def get_stdout_bytes_buffer():
+    # type: () -> BytesIO
+    return cast(BytesIO, getattr(sys.stdout, "buffer", sys.stdout))
+
+
+if PY3:
+    is_valid_python_identifier = str.isidentifier
+else:
+
+    def is_valid_python_identifier(text):
+        # type: (str) -> bool
+
+        # N.B.: Python 2.7 only supports ASCII characters so the check is easy and this is probably
+        # why it's nt in the stdlib.
+        # See: https://docs.python.org/2.7/reference/lexical_analysis.html#identifiers
+        return re.match(r"^[_a-zA-Z][_a-zA-Z0-9]*$", text) is not None

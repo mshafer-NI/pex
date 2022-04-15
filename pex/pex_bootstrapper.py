@@ -3,11 +3,12 @@
 
 from __future__ import absolute_import
 
+import hashlib
 import os
 import sys
 
 from pex import pex_warnings
-from pex.common import atomic_directory, die
+from pex.common import atomic_directory, die, pluralize
 from pex.inherit_path import InheritPath
 from pex.interpreter import PythonInterpreter
 from pex.interpreter_constraints import UnsatisfiableInterpreterConstraintsError
@@ -18,22 +19,21 @@ from pex.typing import TYPE_CHECKING, cast
 from pex.variables import ENV
 
 if TYPE_CHECKING:
-    from typing import (
-        Iterable,
-        Iterator,
-        List,
-        NoReturn,
-        Optional,
-        Tuple,
-        Union,
-        Callable,
-    )
+    from typing import Iterable, Iterator, List, NoReturn, Optional, Set, Tuple, Union
 
+    from pex.interpreter import InterpreterIdentificationError, InterpreterOrError, PathFilter
     from pex.pex import PEX
+    from pex.third_party.pkg_resources import Requirement
 
-    InterpreterIdentificationError = Tuple[str, str]
-    InterpreterOrError = Union[PythonInterpreter, InterpreterIdentificationError]
-    PathFilter = Callable[[str], bool]
+
+def parse_path(path):
+    # type: (Optional[str]) -> Optional[OrderedSet[str]]
+    """Parses a PATH string into a de-duped list of paths."""
+    return (
+        OrderedSet(PythonInterpreter.canonicalize_path(p) for p in path.split(os.pathsep))
+        if path
+        else None
+    )
 
 
 # TODO(John Sirois): Move this to interpreter_constraints.py. As things stand, both pex/bin/pex.py
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 def iter_compatible_interpreters(
     path=None,  # type: Optional[str]
     valid_basenames=None,  # type: Optional[Iterable[str]]
-    interpreter_constraints=None,  # type: Optional[Iterable[str]]
+    interpreter_constraints=None,  # type: Optional[Iterable[Union[str, Requirement]]]
     preferred_interpreter=None,  # type: Optional[PythonInterpreter]
 ):
     # type: (...) -> Iterator[PythonInterpreter]
@@ -75,13 +75,9 @@ def iter_compatible_interpreters(
 
     def _iter_interpreters():
         # type: () -> Iterator[InterpreterOrError]
-        seen = set()
+        seen = set()  # type: Set[InterpreterOrError]
 
-        normalized_paths = (
-            OrderedSet(PythonInterpreter.canonicalize_path(p) for p in path.split(os.pathsep))
-            if path
-            else None
-        )
+        normalized_paths = parse_path(path)
 
         # Prefer the current interpreter, if valid.
         current_interpreter = preferred_interpreter or PythonInterpreter.get()
@@ -151,7 +147,9 @@ def iter_compatible_interpreters(
     if not found and (interpreter_constraints or valid_basenames):
         constraints = []  # type: List[str]
         if interpreter_constraints:
-            constraints.append("Version matches {}".format(" or ".join(interpreter_constraints)))
+            constraints.append(
+                "Version matches {}".format(" or ".join(map(str, interpreter_constraints)))
+            )
         if valid_basenames:
             constraints.append("Basename is {}".format(" or ".join(valid_basenames)))
         raise UnsatisfiableInterpreterConstraintsError(constraints, candidates, failures)
@@ -161,25 +159,30 @@ def _select_path_interpreter(
     path=None,  # type: Optional[str]
     valid_basenames=None,  # type: Optional[Tuple[str, ...]]
     interpreter_constraints=None,  # type: Optional[Iterable[str]]
+    preferred_interpreter=None,  # type: Optional[PythonInterpreter]
 ):
     # type: (...) -> Optional[PythonInterpreter]
     candidate_interpreters_iter = iter_compatible_interpreters(
         path=path,
         valid_basenames=valid_basenames,
         interpreter_constraints=interpreter_constraints,
+        preferred_interpreter=preferred_interpreter,
     )
     current_interpreter = PythonInterpreter.get()  # type: PythonInterpreter
-    candidate_interpreters = []
+    preferred_interpreter = preferred_interpreter or current_interpreter
+    candidate_interpreters = OrderedSet()  # type: OrderedSet[PythonInterpreter]
     for interpreter in candidate_interpreters_iter:
-        if current_interpreter == interpreter:
-            # Always prefer continuing with the current interpreter when possible to avoid re-exec
-            # overhead.
-            return current_interpreter
+        if preferred_interpreter == interpreter:
+            # Always respect the preferred interpreter if it doesn't violate other constraints.
+            return preferred_interpreter
         else:
-            candidate_interpreters.append(interpreter)
+            candidate_interpreters.add(interpreter)
     if not candidate_interpreters:
         return None
-
+    if current_interpreter in candidate_interpreters:
+        # Always prefer continuing with the current interpreter when possible to avoid re-exec
+        # overhead.
+        return current_interpreter
     # TODO: Allow the selection strategy to be parameterized:
     #   https://github.com/pantsbuild/pex/issues/430
     return PythonInterpreter.latest_release_of_min_compatible_version(candidate_interpreters)
@@ -187,13 +190,37 @@ def _select_path_interpreter(
 
 def find_compatible_interpreter(interpreter_constraints=None):
     # type: (Optional[Iterable[str]]) -> PythonInterpreter
+
+    def gather_constraints():
+        # type: () -> Iterable[str]
+        constraints = []
+        if ENV.PEX_PYTHON:
+            constraints.append("PEX_PYTHON={}".format(ENV.PEX_PYTHON))
+        if ENV.PEX_PYTHON_PATH:
+            constraints.append("PEX_PYTHON_PATH={}".format(ENV.PEX_PYTHON_PATH))
+        if interpreter_constraints:
+            constraints.append("Version matches {}".format(" or ".join(interpreter_constraints)))
+        return constraints
+
+    preferred_interpreter = None  # type: Optional[PythonInterpreter]
+    if ENV.PEX_PYTHON and os.path.isabs(ENV.PEX_PYTHON):
+        try:
+            preferred_interpreter = PythonInterpreter.from_binary(ENV.PEX_PYTHON)
+        except PythonInterpreter.Error as e:
+            raise UnsatisfiableInterpreterConstraintsError(
+                constraints=gather_constraints(),
+                candidates=[],
+                failures=[(ENV.PEX_PYTHON, str(e))],
+                preamble=(
+                    "The specified PEX_PYTHON={pex_python} could not be identified as a "
+                    "valid Python interpreter.".format(pex_python=ENV.PEX_PYTHON)
+                ),
+            )
+
     current_interpreter = PythonInterpreter.get()
     target = current_interpreter  # type: Optional[PythonInterpreter]
     with TRACER.timed("Selecting runtime interpreter", V=3):
         if ENV.PEX_PYTHON and not ENV.PEX_PYTHON_PATH:
-            # preserve PEX_PYTHON re-exec for backwards compatibility
-            # TODO: Kill this off completely in favor of PEX_PYTHON_PATH
-            # https://github.com/pantsbuild/pex/issues/431
             TRACER.log(
                 "Using PEX_PYTHON={} constrained by {}".format(
                     ENV.PEX_PYTHON, interpreter_constraints
@@ -205,6 +232,7 @@ def find_compatible_interpreter(interpreter_constraints=None):
                     target = _select_path_interpreter(
                         path=ENV.PEX_PYTHON,
                         interpreter_constraints=interpreter_constraints,
+                        preferred_interpreter=preferred_interpreter,
                     )
                 else:
                     target = _select_path_interpreter(
@@ -229,7 +257,9 @@ def find_compatible_interpreter(interpreter_constraints=None):
             )
             try:
                 target = _select_path_interpreter(
-                    path=ENV.PEX_PYTHON_PATH, interpreter_constraints=interpreter_constraints
+                    path=ENV.PEX_PYTHON_PATH,
+                    interpreter_constraints=interpreter_constraints,
+                    preferred_interpreter=preferred_interpreter,
                 )
             except UnsatisfiableInterpreterConstraintsError as e:
                 raise e.with_preamble(
@@ -238,24 +268,28 @@ def find_compatible_interpreter(interpreter_constraints=None):
                     )
                 )
 
+        if preferred_interpreter and target != preferred_interpreter:
+            candidates = [preferred_interpreter, target] if target else [preferred_interpreter]
+            raise UnsatisfiableInterpreterConstraintsError(
+                constraints=gather_constraints(),
+                candidates=candidates,
+                failures=[],
+                preamble=(
+                    "The specified PEX_PYTHON={pex_python} did not meet other "
+                    "constraints.".format(pex_python=ENV.PEX_PYTHON)
+                ),
+            )
+
         if target is None:
             # N.B.: This can only happen when PEX_PYTHON_PATH is set and interpreter_constraints
             # is empty, but we handle all constraints generally for sanity sake.
-            constraints = []
-            if ENV.PEX_PYTHON:
-                constraints.append("PEX_PYTHON={}".format(ENV.PEX_PYTHON))
-            if ENV.PEX_PYTHON_PATH:
-                constraints.append("PEX_PYTHON_PATH={}".format(ENV.PEX_PYTHON_PATH))
-            if interpreter_constraints:
-                constraints.append(
-                    "Version matches {}".format(" or ".join(interpreter_constraints))
-                )
             raise UnsatisfiableInterpreterConstraintsError(
-                constraints=constraints,
+                constraints=gather_constraints(),
                 candidates=[current_interpreter],
                 failures=[],
                 preamble="Could not find a compatible interpreter.",
             )
+
         return target
 
 
@@ -359,31 +393,102 @@ def _bootstrap(entry_point):
     # type: (str) -> PexInfo
     pex_info = PexInfo.from_pex(entry_point)  # type: PexInfo
     pex_info.update(PexInfo.from_env())
-    pex_warnings.configure_warnings(pex_info, ENV)
+    pex_warnings.configure_warnings(ENV, pex_info=pex_info)
     return pex_info
 
 
-def ensure_venv(pex):
-    # type: (PEX) -> str
+def ensure_venv(
+    pex,  # type: PEX
+    collisions_ok=True,  # type: bool
+):
+    # type: (...) -> str
     pex_info = pex.pex_info()
-    venv_dir = pex_info.venv_dir
+    venv_dir = pex_info.venv_dir(pex_file=pex.path(), interpreter=pex.interpreter)
     if venv_dir is None:
         raise AssertionError(
             "Expected PEX-INFO for {} to have the components of a venv directory".format(pex.path())
         )
+    if not pex_info.includes_tools:
+        raise ValueError(
+            "The PEX_VENV environment variable was set, but this PEX was not built with venv "
+            "support (Re-build the PEX file with `pex --venv ...`)"
+        )
     with atomic_directory(venv_dir, exclusive=True) as venv:
-        if venv:
-            from .tools.commands.venv import populate_venv_with_pex
-            from .tools.commands.virtualenv import Virtualenv
+        if not venv.is_finalized():
+            from pex.venv.pex import populate_venv
+            from pex.venv.virtualenv import Virtualenv
 
-            virtualenv = Virtualenv.create(venv_dir=venv, interpreter=pex.interpreter)
-            populate_venv_with_pex(
-                virtualenv,
-                pex,
-                bin_path=pex_info.venv_bin_path,
-                python=os.path.join(venv_dir, "bin", os.path.basename(pex.interpreter.binary)),
-                collisions_ok=True,
+            virtualenv = Virtualenv.create_atomic(
+                venv_dir=venv,
+                interpreter=pex.interpreter,
+                copies=pex_info.venv_copies,
+                prompt=os.path.basename(ENV.PEX) if ENV.PEX else None,
             )
+
+            pex_path = os.path.abspath(pex.path())
+
+            # A sha1 hash is 160 bits -> 20 bytes -> 40 hex characters. We start with 8 characters
+            # (32 bits) of entropy since that is short and _very_ unlikely to collide with another
+            # PEX venv on this machine. If we still collide after using the whole sha1 (for a total
+            # of 33 collisions), then the universe is broken and we raise. It's the least we can do.
+            venv_hash = hashlib.sha1(venv_dir.encode("utf-8")).hexdigest()
+            collisions = []
+            for chars in range(8, len(venv_hash) + 1):
+                entropy = venv_hash[:chars]
+                short_venv_dir = os.path.join(pex_info.pex_root, "venvs", "s", entropy)
+                with atomic_directory(short_venv_dir, exclusive=True) as short_venv:
+                    if short_venv.is_finalized():
+                        collisions.append(short_venv_dir)
+                        if entropy == venv_hash:
+                            raise RuntimeError(
+                                "The venv for {pex} at {venv} has hash collisions with {count} "
+                                "other {venvs}!\n{collisions}".format(
+                                    pex=pex_path,
+                                    venv=venv_dir,
+                                    count=len(collisions),
+                                    venvs=pluralize(collisions, "venv"),
+                                    collisions="\n".join(
+                                        "{index}.) {venv_path}".format(
+                                            index=index, venv_path=os.path.realpath(path)
+                                        )
+                                        for index, path in enumerate(collisions, start=1)
+                                    ),
+                                )
+                            )
+                        continue
+
+                    os.symlink(venv_dir, os.path.join(short_venv.work_dir, "venv"))
+                    shebang = populate_venv(
+                        virtualenv,
+                        pex,
+                        bin_path=pex_info.venv_bin_path,
+                        python=os.path.join(
+                            short_venv_dir, "venv", "bin", os.path.basename(pex.interpreter.binary)
+                        ),
+                        collisions_ok=collisions_ok,
+                        symlink=not pex_info.venv_site_packages_copies,
+                    )
+
+                    # There are popular Linux distributions with shebang length limits
+                    # (BINPRM_BUF_SIZE in /usr/include/linux/binfmts.h) set at 128 characters, so
+                    # we warn in the _very_ unlikely case that our shortened shebang is longer than
+                    # this.
+                    if len(shebang) > 128:
+                        pex_warnings.warn(
+                            "The venv for {pex} at {venv} has script shebangs of {shebang!r} with "
+                            "{count} characters. On some systems this may be too long and cause "
+                            "problems running the venv scripts. You may be able adjust PEX_ROOT "
+                            "from {pex_root} to a shorter path as a work-around.".format(
+                                pex=pex_path,
+                                venv=venv_dir,
+                                shebang=shebang,
+                                count=len(shebang),
+                                pex_root=pex_info.pex_root,
+                            )
+                        )
+
+                    break
+
     return os.path.join(venv_dir, "pex")
 
 
@@ -392,22 +497,28 @@ def bootstrap_pex(entry_point):
     # type: (str) -> None
     pex_info = _bootstrap(entry_point)
 
-    if not ENV.PEX_TOOLS and pex_info.venv:
-        try:
-            target = find_compatible_interpreter(
-                interpreter_constraints=pex_info.interpreter_constraints,
-            )
-        except UnsatisfiableInterpreterConstraintsError as e:
-            die(str(e))
-        from . import pex
+    # ENV.PEX_ROOT is consulted by PythonInterpreter and Platform so set that up as early as
+    # possible in the run.
+    with ENV.patch(PEX_ROOT=pex_info.pex_root):
+        if not (ENV.PEX_UNZIP or ENV.PEX_TOOLS) and pex_info.venv:
+            try:
+                target = find_compatible_interpreter(
+                    interpreter_constraints=pex_info.interpreter_constraints,
+                )
+            except UnsatisfiableInterpreterConstraintsError as e:
+                die(str(e))
+            from . import pex
 
-        venv_pex = ensure_venv(pex.PEX(entry_point, interpreter=target))
-        os.execv(venv_pex, [venv_pex] + sys.argv[1:])
-    else:
-        maybe_reexec_pex(pex_info.interpreter_constraints)
-        from . import pex
+            try:
+                venv_pex = ensure_venv(pex.PEX(entry_point, interpreter=target))
+            except ValueError as e:
+                die(str(e))
+            os.execv(venv_pex, [venv_pex] + sys.argv[1:])
+        else:
+            maybe_reexec_pex(pex_info.interpreter_constraints)
+            from . import pex
 
-        pex.PEX(entry_point).execute()
+            pex.PEX(entry_point).execute()
 
 
 # NB: This helper is used by third party libs - namely https://github.com/wickman/lambdex.
@@ -428,4 +539,4 @@ def bootstrap_pex_env(entry_point):
 
     from .environment import PEXEnvironment
 
-    PEXEnvironment(entry_point, pex_info).activate()
+    PEXEnvironment.mount(entry_point, pex_info).activate()

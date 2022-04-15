@@ -4,6 +4,7 @@
 from __future__ import absolute_import
 
 import contextlib
+import hashlib
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from hashlib import sha1
 from site import makepath  # type: ignore[attr-defined]
 from zipfile import ZipFile
 
+from pex import hashing
 from pex.common import atomic_directory, filter_pyc_dirs, filter_pyc_files, safe_mkdir, safe_mkdtemp
 from pex.compatibility import (  # type: ignore[attr-defined]  # `exec_function` is defined dynamically
     PY2,
@@ -27,11 +29,9 @@ from pex.tracer import TRACER
 from pex.typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    if PY2:
-        from hashlib import _hash as _Hash
-    else:
-        from hashlib import _Hash
-    from typing import Any, Callable, IO, Iterable, Iterator, Optional
+    from typing import IO, Any, Callable, Iterator, Optional, Text
+
+    from pex.hashing import Hasher
 
 
 class DistributionHelper(object):
@@ -83,7 +83,7 @@ class DistributionHelper(object):
 
     @classmethod
     def distribution_from_path(cls, path, name=None):
-        # type: (str, Optional[str]) -> Optional[Distribution]
+        # type: (Text, Optional[str]) -> Optional[Distribution]
         """Return a distribution from a path.
 
         If name is provided, find the distribution.  If none is found matching the name, return
@@ -103,67 +103,37 @@ class DistributionHelper(object):
 
 class CacheHelper(object):
     @classmethod
-    def update_hash(cls, filelike, digest):
-        # type: (IO[bytes], _Hash) -> None
-        """Update the digest of a single file in a memory-efficient manner."""
-        block_size = digest.block_size * 1024
-        for chunk in iter(lambda: filelike.read(block_size), b""):
-            digest.update(chunk)
-
-    @classmethod
     def hash(cls, path, digest=None, hasher=sha1):
-        # type: (str, Optional[_Hash], Callable) -> str
+        # type: (str, Optional[Hasher], Callable[[], Hasher]) -> str
         """Return the digest of a single file in a memory-efficient manner."""
         if digest is None:
             digest = hasher()
-        with open(path, "rb") as fh:
-            cls.update_hash(fh, digest)
+        hashing.file_hash(path, digest)
         return digest.hexdigest()
-
-    @classmethod
-    def _compute_hash(cls, names, stream_factory):
-        # type: (Iterable[str], Callable[[str], IO]) -> str
-        digest = sha1()
-        # Always use / as the path separator, since that's what zip uses.
-        hashed_names = [n.replace(os.sep, "/") for n in names]
-        digest.update("".join(hashed_names).encode("utf-8"))
-        for name in names:
-            with contextlib.closing(stream_factory(name)) as fp:
-                cls.update_hash(fp, digest)
-        return digest.hexdigest()
-
-    @classmethod
-    def _iter_non_pyc_files(cls, directory):
-        # type: (str) -> Iterator[str]
-        normpath = os.path.realpath(os.path.normpath(directory))
-        for root, dirs, files in os.walk(normpath):
-            dirs[:] = list(filter_pyc_dirs(dirs))
-            for f in filter_pyc_files(files):
-                yield os.path.relpath(os.path.join(root, f), normpath)
 
     @classmethod
     def pex_code_hash(cls, d):
         # type: (str) -> str
         """Return a reproducible hash of the contents of a loose PEX; excluding all `.pyc` files."""
-        names = sorted(f for f in cls._iter_non_pyc_files(d) if not f.startswith("."))
-
-        def stream_factory(name):
-            # type: (str) -> IO
-            return open(os.path.join(d, name), "rb")  # noqa: T802
-
-        return cls._compute_hash(names, stream_factory)
+        digest = hashlib.sha1()
+        hashing.dir_hash(
+            directory=d,
+            digest=digest,
+            dir_filter=filter_pyc_dirs,
+            file_filter=lambda files: (f for f in filter_pyc_files(files) if not f.startswith(".")),
+        )
+        return digest.hexdigest()
 
     @classmethod
-    def dir_hash(cls, d):
-        # type: (str) -> str
+    def dir_hash(cls, d, digest=None, hasher=sha1):
+        # type: (str, Optional[Hasher], Callable[[], Hasher]) -> str
         """Return a reproducible hash of the contents of a directory; excluding all `.pyc` files."""
-        names = sorted(cls._iter_non_pyc_files(d))
-
-        def stream_factory(name):
-            # type: (str) -> IO
-            return open(os.path.join(d, name), "rb")  # noqa: T802
-
-        return cls._compute_hash(names, stream_factory)
+        if digest is None:
+            digest = hasher()
+        hashing.dir_hash(
+            directory=d, digest=digest, dir_filter=filter_pyc_dirs, file_filter=filter_pyc_files
+        )
+        return digest.hexdigest()
 
     @classmethod
     def cache_distribution(cls, zf, source, target_dir):
@@ -180,13 +150,13 @@ class CacheHelper(object):
         :returns: The cached distribution.
         """
         with atomic_directory(target_dir, source=source, exclusive=True) as target_dir_tmp:
-            if target_dir_tmp is None:
-                TRACER.log("Using cached {}".format(target_dir))
+            if target_dir_tmp.is_finalized():
+                TRACER.log("Using cached {}".format(target_dir), V=3)
             else:
                 with TRACER.timed("Caching {}:{} in {}".format(zf.filename, source, target_dir)):
                     for name in zf.namelist():
                         if name.startswith(source) and not name.endswith("/"):
-                            zf.extract(name, target_dir_tmp)
+                            zf.extract(name, target_dir_tmp.work_dir)
 
         dist = DistributionHelper.distribution_from_path(target_dir)
         assert dist is not None, "Failed to cache distribution: {} ".format(source)

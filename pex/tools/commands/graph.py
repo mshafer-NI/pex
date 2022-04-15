@@ -7,24 +7,26 @@ import logging
 import os
 import tempfile
 import threading
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
 from contextlib import contextmanager
 
+from pex.commands.command import OutputMixin, try_open_file, try_run_program
 from pex.common import safe_mkdir
 from pex.dist_metadata import requires_dists
 from pex.pex import PEX
-from pex.tools.command import Command, Ok, OutputMixin, Result, try_open_file, try_run_program
+from pex.result import Ok, Result
+from pex.tools.command import PEXCommand
 from pex.tools.commands.digraph import DiGraph
 from pex.typing import TYPE_CHECKING
 from pex.variables import ENV
 
 if TYPE_CHECKING:
-    from typing import Iterator, IO, Tuple
+    from typing import IO, Iterator, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-class Graph(OutputMixin, Command):
+class Graph(OutputMixin, PEXCommand):
     """Generates a dot graph of the dependencies contained in a PEX file."""
 
     @staticmethod
@@ -38,10 +40,10 @@ class Graph(OutputMixin, Command):
                 pex.path(), pex.interpreter.binary, pex.interpreter.identity.requirement
             ),
         )
-        marker_environment = pex.interpreter.identity.env_markers.copy()
-        marker_environment["extra"] = []
-        present_dists = frozenset(dist.project_name for dist in pex.activate())
-        for dist in pex.activate():
+        marker_environment = pex.interpreter.identity.env_markers.as_dict()
+        marker_environment["extra"] = ""
+        present_dists = frozenset(dist.project_name for dist in pex.resolve())
+        for dist in pex.resolve():
             graph.add_node(
                 name=dist.project_name,
                 label="{name} {version}".format(name=dist.project_name, version=dist.version),
@@ -77,9 +79,10 @@ class Graph(OutputMixin, Command):
                 )
         return graph
 
-    def add_arguments(self, parser):
+    @classmethod
+    def add_arguments(cls, parser):
         # type: (ArgumentParser) -> None
-        self.add_output_option(parser, entity="dot graph")
+        cls.add_output_option(parser, entity="dot graph")
         parser.add_argument(
             "-r",
             "--render",
@@ -97,10 +100,10 @@ class Graph(OutputMixin, Command):
             action="store_true",
             help="Attempt to open the graph in the system viewer (implies --render).",
         )
+        cls.register_global_arguments(parser)
 
-    @staticmethod
     def _dot(
-        options,  # type: Namespace
+        self,
         graph,  # type: DiGraph
         render_fp,  # type: IO
     ):
@@ -120,7 +123,7 @@ class Graph(OutputMixin, Command):
                 "dot",
                 url="https://graphviz.org/",
                 error="Failed to render dependency graph for {}.".format(graph.name),
-                args=["-T", options.format],
+                args=["-T", self.options.format],
                 stdin=read_fd,
                 stdout=render_fp,
             )
@@ -128,41 +131,37 @@ class Graph(OutputMixin, Command):
             emit_thread.join()
 
     @contextmanager
-    def _output_for_open(self, options):
-        # type: (Namespace) -> Iterator[Tuple[IO, str]]
-        if self.is_stdout(options):
+    def _output_for_open(self):
+        # type: () -> Iterator[Tuple[IO, str]]
+        if self.is_stdout(self.options):
             tmpdir = os.path.join(ENV.PEX_ROOT, "tmp")
             safe_mkdir(tmpdir)
             with tempfile.NamedTemporaryFile(
                 prefix="{}.".format(__name__),
-                suffix=".deps.{}".format(options.format),
+                suffix=".deps.{}".format(self.options.format),
                 dir=tmpdir,
                 delete=False,
             ) as tmp_out:
                 yield tmp_out, tmp_out.name
                 return
 
-        with self.output(options, binary=True) as out:
+        with self.output(self.options, binary=True) as out:
             yield out, out.name
 
-    def run(
-        self,
-        pex,  # type: PEX
-        options,  # type: Namespace
-    ):
-        # type: (...) -> Result
+    def run(self, pex):
+        # type: (PEX) -> Result
         graph = self._create_dependency_graph(pex)
-        if not (options.render or options.open):
-            with self.output(options) as out:
+        if not (self.options.render or self.options.open):
+            with self.output(self.options) as out:
                 graph.emit(out)
             return Ok()
 
-        if not options.open:
-            with self.output(options, binary=True) as out:
-                return self._dot(options, graph, out)
+        if not self.options.open:
+            with self.output(self.options, binary=True) as out:
+                return self._dot(graph, out)
 
-        with self._output_for_open(options) as (out, open_path):
-            result = self._dot(options, graph, out)
+        with self._output_for_open() as (out, open_path):
+            result = self._dot(graph, out)
             if result.is_error:
                 return result
 

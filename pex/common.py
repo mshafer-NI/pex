@@ -416,7 +416,7 @@ def _get_lock_api(
     def _handler(
         lock_fd, # type: int
         operation, # type: int
-        ) -> None:
+        ):
         if WINDOWS:
             if operation is msvcrt.LK_LOCK:
                 while True:

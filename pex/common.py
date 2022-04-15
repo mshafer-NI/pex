@@ -27,8 +27,12 @@ from pex.typing import TYPE_CHECKING, cast
 
 if WINDOWS:
     import msvcrt
+    _LOCK_UN = msvcrt.LK_UNLCK
+    _LOCK_EX = msvcrt.LK_LOCK
 else:
     import fcntl
+    _LOCK_UN = fcntl.LOCK_UN
+    _LOCK_EX = fcntl.LOCK_EX
 
 if TYPE_CHECKING:
     from typing import (
@@ -406,6 +410,33 @@ class FileLockStyle(Enum["FileLockStyle.Value"]):
     BSD = Value("bsd")
     POSIX = Value("posix")
 
+def _get_lock_api(
+    exclusive, # type: Union[bool, FileLockStyle.Value]
+):
+    def _handler(lock_fd: int, operation: int) -> None:
+        if WINDOWS:
+            if operation is msvcrt.LK_LOCK:
+                while True:
+                    # Force the non-blocking lock to be blocking. LK_LOCK is msvcrt's implementation of
+                    # a blocking lock, but it only tries 10 times, once per second before rasing an
+                    # OSError.
+                    try:
+                        msvcrt.locking(lock_fd, msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError as ex:
+                        # Deadlock error is raised after failing to lock the file
+                        if ex.errno != errno.EDEADLOCK:
+                            raise
+                        safe_sleep(1)
+            else:
+                return msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+        else:
+            if exclusive is FileLockStyle.BSD:
+                fcntl.flock(lock_fd, operation)
+            else:
+                fcntl.lockf(lock_fd, operation)
+
+    return cast("Callable[[int, int], None]", _handler)
 
 @contextmanager
 def atomic_directory(
@@ -443,17 +474,14 @@ def atomic_directory(
         return
 
     lock_fd = None  # type: Optional[int]
-    lock_api = cast(
-        "Callable[[int, int], None]",
-        fcntl.flock if exclusive is FileLockStyle.BSD else fcntl.lockf,
-    )
+    lock_api = _get_lock_api(exclusive=exclusive)
 
     def unlock():
         # type: () -> None
         if lock_fd is None:
             return
         try:
-            lock_api(lock_fd, fcntl.LOCK_UN)
+            lock_api(lock_fd, _LOCK_UN)
         finally:
             os.close(lock_fd)
 
@@ -470,7 +498,7 @@ def atomic_directory(
         # N.B.: Since lockf and flock operate on an open file descriptor and these are
         # guaranteed to be closed by the operating system when the owning process exits,
         # this lock is immune to staleness.
-        lock_api(lock_fd, fcntl.LOCK_EX)  # A blocking write lock.
+        lock_api(lock_fd, _LOCK_EX)  # A blocking write lock.
         if atomic_dir.is_finalized():
             # We lost the double-checked locking race and our work was done for us by the race
             # winner so exit early.

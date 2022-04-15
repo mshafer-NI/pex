@@ -413,7 +413,10 @@ class FileLockStyle(Enum["FileLockStyle.Value"]):
 def _get_lock_api(
     exclusive, # type: Union[bool, FileLockStyle.Value]
 ):
-    def _handler(lock_fd: int, operation: int) -> None:
+    def _handler(
+        lock_fd, # type: int
+        operation, # type: int
+        ) -> None:
         if WINDOWS:
             if operation is msvcrt.LK_LOCK:
                 while True:

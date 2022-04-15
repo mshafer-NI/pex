@@ -12,6 +12,8 @@ runs:
   steps:
     - name: Expose Pythons
       run: |
+        echo $(uname -s)
+        find /c/hostedtoocache/ -type f
         if [[ "$(uname -s)" == "Darwin" ]]; then
           toolcache="/Users/runner/hostedtoolcache"
           python_bin_suffix="/bin"

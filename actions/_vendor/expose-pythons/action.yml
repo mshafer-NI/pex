@@ -13,7 +13,8 @@ runs:
     - name: Expose Pythons
       run: |
         echo $(uname -s)
-        find /c/hostedtoocache/ -type f
+        which python3
+        find /c/hostedtoocache/ -type f || echo "windows path does not exist"
         if [[ "$(uname -s)" == "Darwin" ]]; then
           toolcache="/Users/runner/hostedtoolcache"
           python_bin_suffix="/bin"

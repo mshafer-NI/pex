@@ -6,7 +6,6 @@ from __future__ import absolute_import, print_function
 import atexit
 import contextlib
 import errno
-import fcntl
 import itertools
 import os
 import re

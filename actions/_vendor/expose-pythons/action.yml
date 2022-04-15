@@ -18,8 +18,7 @@ runs:
         if [[ "$(uname -s)" == "Darwin" ]]; then
           toolcache="/Users/runner/hostedtoolcache"
           python_bin_suffix="/bin"
-          python_search_location="x64"
-        elif [[ "$(uname -s)" == "MINGW64_NT*" ]]; then
+        elif [[ "$(uname -s)" == MINGW64_NT* ]]; then
           toolcache="/c/hostedtoolcache/windows"
           python_bin_suffix="/bin"
         else

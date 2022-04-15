@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-# TODO: make sure these are marked +x on Linux
 set -euo pipefail
 
 function run_black {
